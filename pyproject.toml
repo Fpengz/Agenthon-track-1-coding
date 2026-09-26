@@ -30,7 +30,11 @@ dependencies = [
   # comment block already records: an import error inside the checks, scored as a wrong answer.
   "pyarrow>=15",
   "scikit-learn>=1.4",
+  "openai>=3.19.2",
 ]
 
 [tool.setuptools]
-packages = ["qfbench2_track_coding"]
+packages = ["qfbench2_track_coding", "agent"]
+
+[tool.uv.sources]
+qfbench2-common = { git = "https://github.com/Agenthon-2026/Agenthon2026-public.git", tag = "v2.4.3", subdirectory = "common" }

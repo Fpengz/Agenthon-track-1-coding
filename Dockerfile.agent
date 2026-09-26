@@ -1,0 +1,33 @@
+# ==============================================================================
+# Agenthon 2026 / QFBench 2.0 Track 1 - Financial Coding Agent Docker Image
+# ==============================================================================
+# Inherits from the shared sandbox base image which already contains:
+# - Python 3.13 scientific stack: numpy, pandas, scipy, statsmodels, scikit-learn
+# - Financial packages: TA-Lib, pyarrow, arch, polars
+# - Verification stack: pytest, pytest-json-report, pytest-timeout
+# ==============================================================================
+FROM finance-bench-sandbox:latest
+
+# Install openai client to communicate with the organizer-hosted House Model
+RUN pip install --no-cache-dir openai==1.40.0
+
+# Set up application workspace
+WORKDIR /app
+
+# Copy the agent package into the container
+COPY agent /app/agent
+
+# Ensure python can import the agent module from anywhere
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
+# Mandatory submission contract label
+LABEL qfbench2.interface_version="2.0"
+
+# Create a symlink / binary on PATH for the solve verb as a fallback
+RUN echo '#!/bin/sh\nexec python -m agent.main "$@"' > /usr/local/bin/solve \
+    && chmod +x /usr/local/bin/solve
+
+# Submission CLI contract:
+# docker run ... <IMAGE> solve --task-dir /input --out /app/output
+ENTRYPOINT ["python", "-m", "agent.main"]
+CMD ["solve", "--task-dir", "/input", "--out", "/app/output"]
