@@ -59,6 +59,12 @@ CRITICAL OPERATING RULES:
 
 _MAX_PATH_MAP_LINES = 40
 
+STRUCTURE_INSTRUCTION = """4. Structure the script as one function per deliverable that computes it and writes it to
+   OUTPUT_DIR immediately. Load inputs once and pass them in. In main(), call each deliverable
+   function inside try/except, print the full traceback of any failure, continue with the rest,
+   and finally exit with status 1 if any deliverable failed (so every error is reported at once).
+"""
+
 EDIT_INSTRUCTIONS = """Reply with targeted edits to the script, NOT a full rewrite (it is long, and a
 rewrite would overrun your ~4,000-token reply cap). Use one or more blocks of exactly this form:
 
@@ -81,6 +87,7 @@ def build_initial_prompt(
     input_previews: str = "",
     domain_notes: str = "",
     reference_example: str = "",
+    structured: bool = False,
 ) -> str:
     """Format the initial prompt for the coding agent (the task prompt reused by every turn)."""
     notes_str = (
@@ -121,7 +128,7 @@ def build_initial_prompt(
 1. Write a complete, standalone Python script that reads inputs from TASK_DIR and writes the required deliverables to OUTPUT_DIR.
 2. Ensure all column names, file formats, and data structures match the specification exactly.
 3. Keep reasoning brief, then enclose your complete script inside one ```python ... ``` code block.
-"""
+{STRUCTURE_INSTRUCTION if structured else ""}"""
 
 
 def build_repair_prompt(

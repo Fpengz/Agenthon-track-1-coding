@@ -92,6 +92,13 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   2 use a judge request. Independent solutions rarely agree exactly (0.40-0.91 in a smoke run);
   consensus runs need a larger AGENT_TIME_BUDGET_SEC. Motivation: 12 units
   pass in some runs and fail in others; locking them in would take pass@1 from 0.15 to ~0.23.
+- `spec.py` — `AGENT_SPEC_CHECKS` (default off): required columns / JSON key paths parsed from the
+  instruction (headings, column tables, `Columns:` lines, JSON examples with `<float>`
+  placeholders); after a clean run, missing ones trigger up to 2 repair turns. Parses 62/86 units;
+  0 false positives on 33 checker-passed outputs, fires on 40/277 checker-failed ones.
+- Other switches, all default off until A/B-tested: `AGENT_EXAMPLES` (few-shot library),
+  `AGENT_STRUCTURED` (one function per deliverable, failures isolated and reported together),
+  `HOUSE_REASONING=low`.
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt

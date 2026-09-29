@@ -34,7 +34,8 @@ it): it is reproducible from `units/` and was most of a run's disk use.
    flag; a dirty run cannot be reproduced from the commit and is marked `*` in `runs list`.
    It also records the Docker image *ID* (tags get rebuilt), the checker image, the served model,
    every behaviour setting (`HOUSE_REASONING`, `AGENT_MAX_REVIEWS`, `AGENT_TIME_BUDGET_SEC`,
-   `HOUSE_CONTEXT_TOKENS`, `HOUSE_REQUEST_TIMEOUT`, `AGENT_DOMAIN_NOTES`, `AGENT_CANDIDATES`), `-j`,
+   `HOUSE_CONTEXT_TOKENS`, `HOUSE_REQUEST_TIMEOUT`, `AGENT_DOMAIN_NOTES`, `AGENT_CANDIDATES`,
+   `AGENT_SPEC_CHECKS`, `AGENT_EXAMPLES`, `AGENT_STRUCTURED`), `-j`,
    and the unit
    list. Each run also keeps its own `run.log`.
 

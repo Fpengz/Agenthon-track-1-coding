@@ -40,6 +40,7 @@ from agent.review import (
     restore_outputs,
     snapshot_outputs,
 )
+from agent.spec import DeliverableSpec, parse_spec, spec_problems
 
 logger = logging.getLogger(__name__)
 NO_CODE_MARKER = "\n\n### NOTE:\n"
@@ -68,7 +69,19 @@ MIN_EXEC_TIMEOUT_SEC = 30
 # submitted, and with 2 a judge request decides. Independent solutions rarely agree exactly
 # (smoke run: pairwise agreement 0.40-0.91), so the medoid uses partial agreement as evidence.
 CANDIDATES = max(1, int(os.environ.get("AGENT_CANDIDATES", "1")))
-CANDIDATE_RESERVE_SHARE = 0.3  # at most this share of the budget is held back from candidate A
+CANDIDATE_RESERVE_SHARE = 0.3
+# Instruction-derived output checks (agent/spec.py): missing columns / JSON keys after a clean
+# run trigger up to MAX_SPEC_REPAIRS repair turns. Off by default until A/B-tested.
+SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", "true", "on"}
+MAX_SPEC_REPAIRS = 2
+# Few-shot reference examples from agent/examples/library.jsonl (rule 8: OTHER units only).
+EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true", "on"}
+# One function per deliverable, failures isolated and reported together (fewer no-output units).
+STRUCTURED = os.environ.get("AGENT_STRUCTURED", "0").strip().lower() in {
+    "1",
+    "true",
+    "on",
+}  # at most this share of the budget is held back from candidate A
 CANDIDATE_ATTEMPTS = 6
 CANDIDATE_TEMPERATURE = 0.7
 CANDIDATE_MIN_SEC = 120.0
@@ -206,6 +219,7 @@ class AgentSolver:
         self.out_dir = pathlib.Path(out_dir).resolve()
         self.max_retries = max_retries
         self.client = client or HouseModelClient()
+        self.spec: list[DeliverableSpec] = []
         self.time_budget = self._time_budget()
         self.deadline = time.monotonic() + self.time_budget
         logger.debug(
@@ -353,6 +367,7 @@ class AgentSolver:
         path_map = container_path_map(self.task_dir)
         if path_map:
             logger.info("Resolved %d container path(s) from environment/Dockerfile", len(path_map))
+        self.spec = parse_spec(instruction_text, expected_deliverables) if SPEC_CHECKS else []
         self._prompt_parts = _PromptParts(
             instruction_text=instruction_text,
             discovered_files=relative_inputs,
@@ -361,7 +376,7 @@ class AgentSolver:
                 "input_previews": build_input_previews(self.task_dir, input_files),
                 "domain_notes": domain_notes(self.task_dir, instruction_text),
                 "reference_example": format_example(
-                    select_example(self.task_dir, instruction_text)
+                    select_example(self.task_dir, instruction_text) if EXAMPLES else None
                 ),
             },
         )
@@ -392,6 +407,7 @@ class AgentSolver:
                 out_dir=str(out_dir),
                 discovered_files=parts.discovered_files,
                 path_map=parts.path_map,
+                structured=STRUCTURED,
                 **{k: v for k, v in parts.optional.items() if k not in dropped},
             )
             for dropped in _DROP_ORDER
@@ -425,6 +441,7 @@ class AgentSolver:
         last_failed_code = ""
         last_feedback = ""
         edit_base = ""  # the script shown in the pending repair/review prompt (edits apply to it)
+        spec_repairs = 0
         loop_started = time.monotonic()
 
         # Iterative execution & self-repair loop
@@ -597,6 +614,24 @@ class AgentSolver:
                     accepted_seconds = exec_result.duration
                     reviewed_code = code
                     last_error = ""
+                    problems = spec_problems(self.spec, self.out_dir) if self.spec else []
+                    if problems and spec_repairs < MAX_SPEC_REPAIRS and self._requests_left() >= 2:
+                        # Clean run, but required columns/keys are missing: a precise repair turn
+                        # (the imperfect run stays snapshotted as the fallback).
+                        spec_repairs += 1
+                        logger.warning("Spec check failed: %s", problems[:3])
+                        continuations = 0
+                        edit_base = code
+                        user_prompt = build_repair_prompt(
+                            edit_mode=_edit_mode(code),
+                            task_prompt=initial_prompt,
+                            previous_code=code,
+                            error_message="\n".join(problems),
+                            out_dir=str(self.out_dir),
+                            headline="Your script ran, but its outputs do not match the "
+                            "specification: required columns or keys are missing.",
+                        )
+                        continue
                     elapsed = time.monotonic() - loop_started
                     requests_left = getattr(self.client, "max_requests", 0) - getattr(
                         self.client, "request_count", 0

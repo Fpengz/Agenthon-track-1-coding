@@ -492,3 +492,62 @@ def test_consensus_medoid_picks_the_most_supported_candidate(tmp_path, monkeypat
     assert _solver(tmp_path, client).run()
     assert client.request_count == 4  # no judge needed with three candidates
     assert (tmp_path / "out" / "r.json").read_text() == '{"p": 1, "q": 2}'
+
+
+SPEC_INSTRUCTION = """# Task
+### `/output/prices.csv`
+| Column | Type |
+|---|---|
+| `id` | str |
+| `price` | float |
+
+### File 2: stats.csv
+Columns: `mean, std`
+
+### `/output/summary.json`
+```json
+{"n": <int>, "fit": {"alpha": <float>, "beta": <float>}}
+```
+"""
+
+
+def test_parse_spec_formats_and_missing_problems(tmp_path):
+    from agent.spec import parse_spec, spec_problems
+
+    specs = {
+        s.name: s for s in parse_spec(SPEC_INSTRUCTION, ["prices.csv", "stats.csv", "summary.json"])
+    }
+    assert specs["prices.csv"].columns == ["id", "price"]
+    assert specs["stats.csv"].columns == ["mean", "std"]
+    assert specs["summary.json"].json_keys == ["n", "fit", "fit.alpha", "fit.beta"]
+    (tmp_path / "prices.csv").write_text("id,price,extra\na,1,2\n")  # extra columns are fine
+    (tmp_path / "stats.csv").write_text("mean\n1\n")
+    (tmp_path / "summary.json").write_text('{"n": 3, "fit": {"alpha": 1}}')
+    problems = "\n".join(spec_problems(list(specs.values()), tmp_path))
+    assert "prices.csv" not in problems
+    assert "stats.csv: missing required column(s) ['std']" in problems
+    assert "summary.json: missing required key(s) ['fit.beta']" in problems
+
+
+def test_spec_check_turns_a_clean_but_incomplete_run_into_one_repair(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "SPEC_CHECKS", True)
+    (tmp_path / "task").mkdir()
+    (tmp_path / "task" / "instruction.md").write_text(
+        '### `/output/r.json`\n```json\n{"price": <float>, "n": <int>}\n```\n'
+    )
+    complete = WRITE_OK.replace('{"price": 1.5}', '{"price": 1.5, "n": 2}')
+    client = ScriptedClient(WRITE_OK, complete, "VERDICT: PASS")
+    solver = AgentSolver(task_dir=tmp_path / "task", out_dir=tmp_path / "out", client=client)
+    assert solver.run()
+    assert client.request_count == 3  # first script lacked "n" -> spec repair -> review
+    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 1.5, "n": 2}'
+
+
+def test_structured_instruction_only_when_enabled():
+    from agent.prompts import STRUCTURE_INSTRUCTION, build_initial_prompt
+
+    args = dict(instruction_text="t", task_dir="/i", out_dir="/o", discovered_files=[])
+    assert STRUCTURE_INSTRUCTION not in build_initial_prompt(**args)
+    assert STRUCTURE_INSTRUCTION in build_initial_prompt(**args, structured=True)
