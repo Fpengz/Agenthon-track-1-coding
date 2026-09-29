@@ -92,10 +92,21 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   2 use a judge request. Independent solutions rarely agree exactly (0.40-0.91 in a smoke run);
   consensus runs need a larger AGENT_TIME_BUDGET_SEC. Motivation: 12 units
   pass in some runs and fail in others; locking them in would take pass@1 from 0.15 to ~0.23.
-- `spec.py` — `AGENT_SPEC_CHECKS` (default off): required columns / JSON key paths parsed from the
-  instruction (headings, column tables, `Columns:` lines, JSON examples with `<float>`
-  placeholders); after a clean run, missing ones trigger up to 2 repair turns. Parses 62/86 units;
-  0 false positives on 33 checker-passed outputs, fires on 40/277 checker-failed ones.
+- `spec.py` — `AGENT_SPEC_CHECKS` (default off): parsed from the instruction (headings, column
+  tables, bold-bullet paragraphs, `Columns:` sentences, JSON examples with `<float>` placeholders;
+  quoted placeholder KEYS like `"<sector>"` are dynamic and never required): required columns /
+  JSON key paths, numeric columns (Type cell) and numeric JSON values, exact "N rows". After a
+  clean run, findings trigger up to 2 repair turns. Parses 64/86 units. Rule: every check must
+  flag 0 checker-passed outputs (currently 0/95) before it is kept.
+- `context.py` (always on) — canary hygiene and task context. 59/86 instructions carry their own
+  canary GUID (HTML comment or `# ...-canary GUID` heading); a canary in a deliverable is a g2
+  disqualification. Instructions are sanitised before prompting, and every clean run's
+  deliverables are scanned: a leak is never snapshotted or accepted (repair turn instead). The
+  prompt gets an allow-list of card facts (category, difficulty, data cutoff, time limit, compute).
+- `error_context.py` (always on) — `sitecustomize.py` written next to each script: on an
+  uncaught exception it prints an `[agent]` block (failure type, failing line, DataFrame
+  columns/shape/index, dict keys, array shapes of the variables in scope). 28% of failures used
+  to repeat the previous error. Repair prompts start with `Failure type: ...`.
 - Other switches, all default off until A/B-tested: `AGENT_EXAMPLES` (few-shot library),
   `AGENT_STRUCTURED` (one function per deliverable, failures isolated and reported together),
   `HOUSE_REASONING=low`.
@@ -132,7 +143,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
 - `experiments.py` — run ids, manifests, the registry, `runs list/compare/prune` (host tooling;
   standards in `experiments/README.md`: commit before runs you keep, one change per comparison,
   >= 2 runs per variant because units flip between identical runs, same `-j` for comparisons).
-- `inputs.py` — bounded previews of each input file (CSV head + row count, Parquet schema +
+- `inputs.py` — bounded previews (tables also get facts before the sample rows: dtypes, nulls,
+  date ranges, first-column uniqueness, duplicate rows -- a data inspector without request
+  round-trips) of each input file (CSV head + row count, Parquet schema +
   rows, JSON key skeleton, xlsx sheets, ...). Without them the model guesses column names and
   JSON keys and repeats the same `KeyError` on every repair.
 - `container_path_map` (in `loop.py`): 40 instructions cite image paths like

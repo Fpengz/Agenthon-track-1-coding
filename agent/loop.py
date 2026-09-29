@@ -14,6 +14,7 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from agent.client import MAX_OUTPUT_TOKENS, HouseModelClient
 from agent.consensus import compare_outputs
+from agent.context import canary_leaks, card_facts, sanitize_instruction, task_canaries
 from agent.examples import format_example, select_example
 from agent.executor import (
     apply_edits,
@@ -203,6 +204,7 @@ class _PromptParts:
     discovered_files: list[str]
     path_map: list[tuple[str, str]]
     optional: dict[str, str]  # dropped in _DROP_ORDER when a request would not fit
+    task_facts: str = ""
 
 
 class AgentSolver:
@@ -220,6 +222,7 @@ class AgentSolver:
         self.max_retries = max_retries
         self.client = client or HouseModelClient()
         self.spec: list[DeliverableSpec] = []
+        self.canaries: set[str] = set()
         self.time_budget = self._time_budget()
         self.deadline = time.monotonic() + self.time_budget
         logger.debug(
@@ -367,11 +370,16 @@ class AgentSolver:
         path_map = container_path_map(self.task_dir)
         if path_map:
             logger.info("Resolved %d container path(s) from environment/Dockerfile", len(path_map))
+        # The model never sees the task's canary: it is stripped from the instruction, and every
+        # clean run's deliverables are scanned for it before they can be accepted.
+        self.canaries = task_canaries(self.task_dir, instruction_text)
+        instruction_text = sanitize_instruction(instruction_text, self.canaries)
         self.spec = parse_spec(instruction_text, expected_deliverables) if SPEC_CHECKS else []
         self._prompt_parts = _PromptParts(
             instruction_text=instruction_text,
             discovered_files=relative_inputs,
             path_map=path_map,
+            task_facts=card_facts(self.task_dir),
             optional={
                 "input_previews": build_input_previews(self.task_dir, input_files),
                 "domain_notes": domain_notes(self.task_dir, instruction_text),
@@ -408,6 +416,7 @@ class AgentSolver:
                 discovered_files=parts.discovered_files,
                 path_map=parts.path_map,
                 structured=STRUCTURED,
+                task_facts=parts.task_facts,
                 **{k: v for k, v in parts.optional.items() if k not in dropped},
             )
             for dropped in _DROP_ORDER
@@ -608,6 +617,39 @@ class AgentSolver:
                     expected_deliverables, produced_after=started_at
                 )
 
+                leaks = (
+                    canary_leaks(self.out_dir, self.canaries)
+                    if exec_result.success and deliverables_ok
+                    else []
+                )
+                if leaks:
+                    # A deliverable carries the task's canary: that disqualifies the attempt
+                    # (g2), so these outputs are never snapshotted or accepted. Put the last
+                    # clean outputs back (or clear them) and repair.
+                    logger.warning("Canary leaked into deliverables: %s", leaks)
+                    if have_accepted:
+                        restore_outputs(accepted_dir, self.out_dir)
+                    else:
+                        for path in output_files(self.out_dir):
+                            path.unlink()
+                    continuations = 0
+                    last_failed_code = code
+                    edit_base = code
+                    user_prompt = build_repair_prompt(
+                        edit_mode=_edit_mode(code),
+                        task_prompt=initial_prompt,
+                        previous_code=code,
+                        error_message="\n".join(
+                            f"{name}: contains a task identifier (a GUID from the task "
+                            "metadata). Deliverables must contain only the requested results."
+                            for name in leaks
+                        ),
+                        out_dir=str(self.out_dir),
+                        headline="Your script ran, but a deliverable contains a forbidden "
+                        "task identifier.",
+                    )
+                    continue
+
                 if exec_result.success and deliverables_ok:
                     snapshot_outputs(self.out_dir, accepted_dir)
                     have_accepted = True
@@ -679,12 +721,14 @@ class AgentSolver:
                     missing,
                 )
 
-                err_msg = exec_result.feedback
                 if exec_result.success and missing:
                     err_msg = (
-                        f"Script exited with code 0 but required deliverables were not written to "
-                        f"OUTPUT_DIR ({self.out_dir}).\n{err_msg}"
+                        "Failure type: missing deliverable -- the script exited with code 0 but "
+                        f"did not write {missing} to OUTPUT_DIR ({self.out_dir}).\n"
+                        f"{exec_result.feedback}"
                     )
+                else:
+                    err_msg = f"Failure type: {exec_result.failure_kind}\n{exec_result.feedback}"
 
                 continuations = 0
                 last_failed_code = code

@@ -551,3 +551,85 @@ def test_structured_instruction_only_when_enabled():
     args = dict(instruction_text="t", task_dir="/i", out_dir="/o", discovered_files=[])
     assert STRUCTURE_INSTRUCTION not in build_initial_prompt(**args)
     assert STRUCTURE_INSTRUCTION in build_initial_prompt(**args, structured=True)
+
+
+CANARY = "103019c8-8341-49bc-bd88-f749ce8ca90b"
+
+
+def test_sanitize_instruction_removes_every_canary_form(tmp_path):
+    from agent.context import card_facts, sanitize_instruction, task_canaries
+
+    (tmp_path / "card.toml").write_text(
+        f'[contamination]\ncanary_guid = "{CANARY}"\n[metadata]\ncategory = "fx"\n'
+        "[agent]\ntimeout_sec = 1800.0\n[environment]\ncpus = 16\n"
+    )
+    text = (
+        f"<!-- BENCHMARK DATA SHOULD NEVER APPEAR -->\n# finance-bench-canary GUID {CANARY}\n"
+        f"# Task\nUse id {CANARY.upper()} nowhere.\n"
+    )
+    canaries = task_canaries(tmp_path, text)
+    clean = sanitize_instruction(text, canaries)
+    assert CANARY not in clean.lower() and "canary" not in clean.lower()
+    assert clean.startswith("# Task")
+    facts = card_facts(tmp_path)
+    assert "Category: fx" in facts and "1800 s" in facts and CANARY not in facts
+
+
+def test_leaked_canary_is_never_accepted(tmp_path):
+    (tmp_path / "task").mkdir()
+    (tmp_path / "task" / "instruction.md").write_text(
+        f"<!-- canary GUID {CANARY} -->\nWrite /output/r.json"
+    )
+    leaking = WRITE_OK.replace('{"price": 1.5}', f'{{"price": 1.5, "id": "{CANARY}"}}')
+    client = ScriptedClient(leaking, WRITE_OK, "VERDICT: PASS")
+    solver = AgentSolver(task_dir=tmp_path / "task", out_dir=tmp_path / "out", client=client)
+    assert solver.run()
+    assert client.request_count == 3  # leak -> repair -> clean run -> review
+    assert CANARY not in (tmp_path / "out" / "r.json").read_text()
+
+
+def test_error_context_hook_reports_columns_and_failure_type(tmp_path):
+    code = (
+        "import pandas as pd\n"
+        "prices = pd.DataFrame({'Ticker Symbol': ['A'], 'close': [1.0]})\n"
+        "x = prices['Ticker']\n"
+    )
+    result = run_code(code, tmp_path / "w", tmp_path / "o", task_dir=tmp_path, timeout_sec=60)
+    assert result.failure_kind == "missing key or column (KeyError)"
+    assert "[agent] failing line 3: x = prices['Ticker']" in result.stderr
+    assert "columns=['Ticker Symbol', 'close']" in result.stderr
+    assert "sitecustomize.py" not in [p.name for p in (tmp_path / "o").iterdir()]
+
+
+def test_spec_value_checks_and_false_positive_guards(tmp_path):
+    from agent.spec import parse_spec, spec_problems
+
+    instruction = """# Deliverables
+- **`fits.csv`**: Columns: `stock1`, `copula`, `aic`. One row per pair (3 rows total). `copula` values: `gaussian`, `clayton`.
+- **`other.csv`**: Columns: `a`, `b`.
+
+### `/output/prices.csv`
+| Column | Type |
+|---|---|
+| `id` | str |
+| `price` | float64 |
+
+### `/output/summary.json`
+```json
+{"n": <int>, "label": <str>, "weights": {"<sector>": <float>, ...}}
+```
+"""
+    specs = {s.name: s for s in parse_spec(instruction, ["fits.csv", "prices.csv", "summary.json"])}
+    assert specs["fits.csv"].columns == ["stock1", "copula", "aic"]  # not the copula values
+    assert specs["fits.csv"].row_count == 3
+    assert specs["prices.csv"].numeric_columns == ["price"]
+    assert specs["summary.json"].json_keys == ["n", "label", "weights"]  # no dynamic keys
+    assert specs["summary.json"].numeric_keys == ["n"]
+    (tmp_path / "fits.csv").write_text("stock1,copula,aic\nA,gaussian,1\nB,clayton,2\n")
+    (tmp_path / "prices.csv").write_text("id,price\na,1.5\nb,abc\n")
+    (tmp_path / "summary.json").write_text('{"n": "3", "label": "x", "weights": {"tech": 0.4}}')
+    problems = "\n".join(spec_problems(list(specs.values()), tmp_path))
+    assert "fits.csv: has 2 rows; the specification says 3 rows" in problems
+    assert "prices.csv: column 'price' must be numeric" in problems and "'abc'" in problems
+    assert "summary.json: key 'n' must be a number" in problems
+    assert "weights" not in problems

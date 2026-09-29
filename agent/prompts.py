@@ -88,6 +88,7 @@ def build_initial_prompt(
     domain_notes: str = "",
     reference_example: str = "",
     structured: bool = False,
+    task_facts: str = "",
 ) -> str:
     """Format the initial prompt for the coding agent (the task prompt reused by every turn)."""
     notes_str = (
@@ -115,7 +116,7 @@ def build_initial_prompt(
 ### TASK SPECIFICATION:
 {instruction_text}
 
-### RUNTIME ENVIRONMENT:
+{f"### TASK CONTEXT:{chr(10)}{task_facts}{chr(10)}{chr(10)}" if task_facts else ""}### RUNTIME ENVIRONMENT:
 - `/input` in the task specification = env var TASK_DIR (currently `{task_dir}`, read-only)
 - `/output` in the task specification = env var OUTPUT_DIR (currently `{out_dir}`)
 {map_str}- Discovered input files (relative to TASK_DIR):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import warnings
 import zipfile
 from typing import Any
 
@@ -63,20 +64,102 @@ def _count_lines(path: pathlib.Path) -> int | None:
         return sum(1 for _ in fh)
 
 
+_FACT_ROWS = 200_000
+_FACT_MAX_BYTES = 200_000_000
+
+
+def table_facts(df, include_dtypes: bool, sampled: bool) -> str:
+    """Bounded facts about a table: dtypes, nulls, date ranges, key uniqueness, duplicates.
+
+    Placed before the sample rows so they survive clipping; this is what a read-only data
+    inspector would answer, without spending House requests on round-trips.
+    """
+    import pandas as pd
+
+    facts = []
+    if include_dtypes:
+        facts.append("dtypes: " + ", ".join(f"{c}:{t}" for c, t in df.dtypes.astype(str).items()))
+    nulls = {c: int(n) for c, n in df.isna().sum().items() if n}
+    if nulls:
+        shown = list(nulls.items())[:8]
+        facts.append("nulls: " + ", ".join(f"{c}={n}" for c, n in shown))
+    ranges = []
+    for col in df.columns:
+        series = df[col]
+        if not pd.api.types.is_datetime64_any_dtype(series):
+            textual = pd.api.types.is_string_dtype(series) or series.dtype == object
+            if not textual or not any(w in str(col).lower() for w in ("date", "time")):
+                continue
+            series = pd.to_datetime(series, errors="coerce")
+            if series.notna().mean() < 0.9:
+                continue
+        if series.notna().any():
+            ranges.append(f"{col}={series.min().date()}..{series.max().date()}")
+    if ranges:
+        facts.append("date ranges: " + ", ".join(ranges[:4]))
+    if len(df.columns):
+        first = df.columns[0]
+        distinct = int(df[first].nunique(dropna=True))
+        facts.append(
+            f"first column {first!r}: {distinct} distinct"
+            + (", unique" if distinct == len(df) else "")
+        )
+    dupes = int(df.duplicated().sum())
+    if dupes:
+        facts.append(f"{dupes} fully duplicated rows")
+    note = f" (first {_FACT_ROWS} rows)" if sampled else ""
+    return f"facts{note}: " + "; ".join(facts) if facts else ""
+
+
+def _facts_or_empty(read) -> str:
+    try:
+        with warnings.catch_warnings():  # dtype/date-inference chatter must not flood the log
+            warnings.simplefilter("ignore")
+            df, include_dtypes, sampled = read()
+            return table_facts(df, include_dtypes, sampled)
+    except Exception as exc:  # facts are a bonus; never block the preview
+        logger.debug("Table facts failed: %r", exc)
+        return ""
+
+
 def preview_file(path: pathlib.Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".csv", ".tsv"}:
+        import pandas as pd
+
         rows = _count_lines(path)
         count = f"{rows - 1} data rows" if rows else "row count unknown"
-        return f"{count}; first lines:\n{_head_lines(path, 6)}"
+        facts = ""
+        if path.stat().st_size <= _FACT_MAX_BYTES:
+            sep = "\t" if suffix == ".tsv" else ","
+            facts = _facts_or_empty(
+                lambda: (
+                    pd.read_csv(path, sep=sep, nrows=_FACT_ROWS),
+                    True,
+                    bool(rows and rows - 1 > _FACT_ROWS),
+                )
+            )
+        facts_str = f"\n{facts}" if facts else ""
+        return f"{count}{facts_str}\nfirst lines:\n{_head_lines(path, 6)}"
     if suffix in {".parquet", ".pqt"}:
         import pyarrow.parquet as pq
 
         meta = pq.ParquetFile(path)
         schema = ", ".join(f"{f.name}: {f.type}" for f in meta.schema_arrow)
         head = meta.read_row_group(0).slice(0, 3).to_pandas() if meta.num_row_groups else None
+        facts = ""
+        if meta.num_row_groups and path.stat().st_size <= _FACT_MAX_BYTES:
+            total = meta.metadata.num_rows
+            facts = _facts_or_empty(
+                lambda: (
+                    meta.read().slice(0, _FACT_ROWS).to_pandas(),
+                    False,  # the schema line already shows the types
+                    total > _FACT_ROWS,
+                )
+            )
+        facts_str = f"\n{facts}" if facts else ""
         shown = "" if head is None else f"\nfirst rows:\n{head.to_string(max_colwidth=40)}"
-        return f"{meta.metadata.num_rows} rows; columns: {schema}{shown}"
+        return f"{meta.metadata.num_rows} rows; columns: {schema}{facts_str}{shown}"
     if suffix == ".json":
         if path.stat().st_size > _JSON_LOAD_LIMIT:
             return f"large JSON; starts with:\n{_head_lines(path, 5)}"

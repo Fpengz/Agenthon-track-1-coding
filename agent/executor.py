@@ -15,10 +15,12 @@ import sys
 import time
 import tokenize
 
+from agent.error_context import HOOK_SOURCE
+
 logger = logging.getLogger(__name__)
 _LOG_PREVIEW_LIMIT = 1200
 _FEEDBACK_STDOUT_LIMIT = 1500
-_FEEDBACK_STDERR_LIMIT = 3000
+_FEEDBACK_STDERR_LIMIT = 4500  # room for the traceback AND the [agent] context block
 
 
 def _as_text(value: str | bytes | None) -> str:
@@ -236,6 +238,16 @@ class ExecutionResult:
         return lines[-1][:300] if lines else ""
 
     @property
+    def failure_kind(self) -> str:
+        """Short failure classification for the repair prompt's header."""
+        if self.timed_out:
+            return "timeout: the script exceeded its time limit (make it faster)"
+        match = re.search(r"^\[agent\] failure type: (.+)$", self.stderr, re.M)
+        if match:
+            return match.group(1)
+        return self.error_signature.split(":", 1)[0] or "non-zero exit without a traceback"
+
+    @property
     def feedback(self) -> str:
         """Condensed stdout/stderr for the repair prompt, keeping the traceback tail."""
         parts = []
@@ -296,6 +308,8 @@ def run_code(
 
     script_path = attempt_dir / "_solution.py"
     script_path.write_text(code, encoding="utf-8")
+    # Structured error context on failure (agent/error_context.py); imported at interpreter start.
+    (attempt_dir / "sitecustomize.py").write_text(HOOK_SOURCE, encoding="utf-8")
     logger.info(
         "Saved generated Python solution to %s (%d characters)",
         script_path,
@@ -308,6 +322,7 @@ def run_code(
     env["OUTPUT_DIR"] = str(target_out_dir)
     env["PYTHONUNBUFFERED"] = "1"
     env["MPLBACKEND"] = "Agg"  # headless: chart deliverables must not need a display
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(attempt_dir), env.get("PYTHONPATH")]))
 
     logger.info(
         "Executing generated solution (cwd=%s, output_dir=%s, timeout=%ds)",
@@ -351,7 +366,8 @@ def run_code(
     for file in attempt_dir.iterdir():
         if (
             file.is_file()
-            and file.name not in {"_solution.py", "reward.json", "pytest_report.json"}
+            and file.name
+            not in {"_solution.py", "sitecustomize.py", "reward.json", "pytest_report.json"}
             and file.suffix.lower() in _MISPLACED_SUFFIXES
             and not (target_out_dir / file.name).exists()
         ):
