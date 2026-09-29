@@ -102,8 +102,10 @@ def read_card(task_dir: pathlib.Path) -> dict:
 
 
 def notes_enabled() -> bool:
-    """AGENT_DOMAIN_NOTES=0 disables the notes (A/B runs); on by default."""
-    return os.environ.get("AGENT_DOMAIN_NOTES", "1").strip().lower() not in {"0", "false", "off"}
+    """AGENT_DOMAIN_NOTES=1 enables the notes. Off by default: in a 2x2 A/B (runs
+    20260929-1056-notes{0,1}-r{1,2}) they scored 0.140 on vs 0.157 off -- no measurable gain for
+    up to 3,500 prompt characters per request."""
+    return os.environ.get("AGENT_DOMAIN_NOTES", "0").strip().lower() in {"1", "true", "on"}
 
 
 def domain_notes(task_dir: pathlib.Path, instruction: str) -> str:

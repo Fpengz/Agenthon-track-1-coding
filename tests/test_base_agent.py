@@ -327,9 +327,10 @@ def test_select_example_never_uses_the_tasks_own_or_duplicate_solution(tmp_path)
     assert chosen is not None and chosen["unit_id"] == "t1-greeks"
 
 
-def test_domain_notes_pick_the_matching_category(tmp_path):
+def test_domain_notes_pick_the_matching_category(tmp_path, monkeypatch):
     from agent.knowledge import domain_notes
 
+    monkeypatch.setenv("AGENT_DOMAIN_NOTES", "1")
     (tmp_path / "card.toml").write_text(
         '[metadata]\ncategory = "fixed-income"\ntags = ["yield-curve"]\n'
     )
@@ -410,6 +411,8 @@ def test_domain_notes_switch(tmp_path, monkeypatch):
     from agent.knowledge import domain_notes
 
     (tmp_path / "card.toml").write_text('[metadata]\ncategory = "fixed-income"\n')
+    monkeypatch.delenv("AGENT_DOMAIN_NOTES", raising=False)  # off by default
+    assert domain_notes(tmp_path, "Bootstrap a zero coupon yield curve.") == ""
     monkeypatch.setenv("AGENT_DOMAIN_NOTES", "0")
     assert domain_notes(tmp_path, "Bootstrap a zero coupon yield curve.") == ""
     monkeypatch.setenv("AGENT_DOMAIN_NOTES", "1")

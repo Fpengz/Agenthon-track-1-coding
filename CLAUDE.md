@@ -101,7 +101,8 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   copy the old script back; this was the main cause of units ending with no output at all.
 - `AGENT_TRANSCRIPT_DIR` (debug; `solve-units` sets it to `<unit>/meta/transcripts`, outside the
   deliverables) saves every request/response pair. Unset at evaluation.
-- `knowledge.py` — offline domain notes: the "Financial invariants" and "Common mistakes"
+- `knowledge.py` — offline domain notes (OFF by default; `AGENT_DOMAIN_NOTES=1` enables them —
+  a 2x2 A/B showed no gain: 0.140 on vs 0.157 off): the "Financial invariants" and "Common mistakes"
   subsections of `docs/CATEGORIES.md` for the 1-2 most relevant categories (TF-IDF over the
   instruction + card category/tags; card categories are free-form). `Dockerfile.agent` copies
   the doc to `agent/data/CATEGORIES.md`; locally it is read from `docs/`.
