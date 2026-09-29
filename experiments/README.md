@@ -27,7 +27,7 @@ it): it is reproducible from `units/` and was most of a run's disk use.
    ```bash
    docker build -t agenthon-agent:latest -f Dockerfile.agent .
    uv run python -m agent.main solve-units -j 8 --agent-image agenthon-agent:latest \
-     --name notes-on --note "domain notes in the prompt" --baseline 20260929-1003-review-on
+     --name notes-on --note "domain notes in the prompt" --baseline 20260929-0816-review-on
    ```
 
 2. **Commit before a run you want to keep.** The manifest records the git commit and a `dirty`
