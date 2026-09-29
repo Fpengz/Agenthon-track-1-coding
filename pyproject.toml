@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qfbench2-track-coding"
 version = "3.1.0"
-description = "QFBench 2.0 Track-1 verifier/scorer wrapper: exposes qfbench2_track_coding.scoring.build_verifier(ctx) as required by the shared smoke runner (common/README.md contract). All scoring math lives in qfbench2-common."
+description = "QFBench 2.0 Track 1 verifier, scorer, and coding agent. Scoring math lives in qfbench2-common."
 requires-python = ">=3.13"
 # The scoring path SHELLS OUT. `qfbench2_track_coding.scoring._run_trusted_checks` runs each
 # unit's grader-owned `checks/test_outputs.py` with `{sys.executable} -m pytest`, so the scoring
@@ -31,10 +31,52 @@ dependencies = [
   "pyarrow>=15",
   "scikit-learn>=1.4",
   "openai>=3.19.2",
+  "python-dotenv>=1.0,<2",
+  "typer>=0.12,<1",
+  "torch==2.13.0",
+  "torchaudio==2.11.0",
+  "torchvision==0.28.0",
+  "vllm>=0.30.0",
 ]
+
+[project.scripts]
+qfbench-agent = "agent.main:main"
 
 [tool.setuptools]
 packages = ["qfbench2_track_coding", "agent"]
 
 [tool.uv.sources]
 qfbench2-common = { git = "https://github.com/Agenthon-2026/Agenthon2026-public.git", tag = "v2.4.3", subdirectory = "common" }
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[dependency-groups]
+dev = [
+  "ruff>=0.16.9",
+  "ty>=0.0.84",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["agent", "qfbench2_track_coding", "examples", "tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent", "examples", "qfbench2_track_coding"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.ty.environment]
+root = ["."]

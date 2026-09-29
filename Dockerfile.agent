@@ -8,14 +8,19 @@
 # ==============================================================================
 FROM finance-bench-sandbox:latest
 
-# Install openai client to communicate with the organizer-hosted House Model
-RUN pip install --no-cache-dir openai==1.40.0
+# Install the OpenAI-compatible client and the CLI framework used by agent.main.
+# Pinned to the versions in uv.lock (what local runs test). openai==1.40.0 crashed on client
+# construction against the base image's httpx 0.28 ("unexpected keyword argument 'proxies'"),
+# so every unit would have failed before its first House request.
+RUN pip install --no-cache-dir openai==3.19.2 python-dotenv==1.2.3 typer==0.27.2
 
 # Set up application workspace
 WORKDIR /app
 
 # Copy the agent package into the container
 COPY agent /app/agent
+# Offline domain notes (agent/knowledge.py): the organizers' category invariants and pitfalls.
+COPY docs/CATEGORIES.md /app/agent/data/CATEGORIES.md
 
 # Ensure python can import the agent module from anywhere
 ENV PYTHONPATH="/app:${PYTHONPATH}"

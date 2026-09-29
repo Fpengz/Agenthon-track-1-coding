@@ -15,6 +15,9 @@ dist/
 venv/
 env/
 
+# Local credentials and endpoint configuration
+.env
+
 # OS / editor
 .DS_Store
 .idea/
@@ -26,6 +29,8 @@ env/
 # Local scratch
 *.log
 /out/
+# Agent runs: solve-units outputs, staged unit copies, model transcripts, checker reports
+/tmp/
 
 # Safety: never commit the proprietary, local-only folder (it lives outside repos anyway)
 proprietary-DO-NOT-PUSH/

@@ -52,6 +52,19 @@ These live in the **sealed private repo** and are never visible to participants:
 - The canary GUID registry
 - Data generation and reference-output regeneration scripts
 
+## Working on the bundled agent
+
+The project dev group includes Ruff for linting and formatting and Astral ty for type checks.
+From the repository root:
+
+```bash
+uv sync --group dev
+uv run qfbench-agent --help
+uv run ruff check agent
+uv run ruff format --check agent
+uv run ty check agent
+```
+
 ---
 
 ## How a participant uses this repo
