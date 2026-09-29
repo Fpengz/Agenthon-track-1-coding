@@ -44,9 +44,9 @@ NO_CODE_MARKER = "\n\n### NOTE:\n"
 MAX_CONTINUATIONS = 2
 # Self-reviews of a clean run before it is accepted (each costs one House request).
 MAX_REVIEWS = int(os.environ.get("AGENT_MAX_REVIEWS", "2"))  # 0 disables review (A/B runs)
-# No new review starts after this many seconds: the whole roster shares one wall-clock
-# allowance (12 h for 86 units in Development, ~8 min per unit on average).
-REVIEW_DEADLINE_SEC = 480.0
+# No new review starts after this share of the unit's time budget (480 s at the default 600 s),
+# so reviews scale with AGENT_TIME_BUDGET_SEC instead of silently stopping under heavier load.
+REVIEW_DEADLINE_SHARE = 0.8
 EXEC_TIMEOUT_SEC = 300
 # Per-unit time budget. The card's [agent].timeout_sec is a hard limit (a timeout scores 0 even
 # with good outputs), and the whole roster shares one wall-clock allowance (12 h / 86 units in
@@ -180,7 +180,8 @@ class AgentSolver:
         self.out_dir = pathlib.Path(out_dir).resolve()
         self.max_retries = max_retries
         self.client = client or HouseModelClient()
-        self.deadline = time.monotonic() + self._time_budget()
+        self.time_budget = self._time_budget()
+        self.deadline = time.monotonic() + self.time_budget
         logger.debug(
             "Configured AgentSolver (task_dir=%s, out_dir=%s, max_retries=%d)",
             self.task_dir,
@@ -557,7 +558,8 @@ class AgentSolver:
                     requests_left = getattr(self.client, "max_requests", 0) - getattr(
                         self.client, "request_count", 0
                     )
-                    if reviews >= MAX_REVIEWS or elapsed > REVIEW_DEADLINE_SEC or requests_left < 2:
+                    review_deadline = REVIEW_DEADLINE_SHARE * self.time_budget
+                    if reviews >= MAX_REVIEWS or elapsed > review_deadline or requests_left < 2:
                         return self._accept(attempt, "no review budget left", reviewed_code)
                     # Exit code 0 and present files say nothing about correctness: ask the model
                     # to verify the outputs against the specification before accepting them.

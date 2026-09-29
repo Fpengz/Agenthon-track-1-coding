@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import pathlib
 import re
 import tomllib
@@ -100,8 +101,16 @@ def read_card(task_dir: pathlib.Path) -> dict:
         return {}
 
 
+def notes_enabled() -> bool:
+    """AGENT_DOMAIN_NOTES=0 disables the notes (A/B runs); on by default."""
+    return os.environ.get("AGENT_DOMAIN_NOTES", "1").strip().lower() not in {"0", "false", "off"}
+
+
 def domain_notes(task_dir: pathlib.Path, instruction: str) -> str:
     """Invariants and common mistakes for the task's most relevant categories ("" if none)."""
+    if not notes_enabled():
+        logger.info("Domain notes disabled (AGENT_DOMAIN_NOTES)")
+        return ""
     sections = load_sections()
     if not sections:
         return ""

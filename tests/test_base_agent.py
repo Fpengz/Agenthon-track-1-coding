@@ -404,3 +404,13 @@ def test_experiment_registry_roundtrip_and_compare(tmp_path):
     assert "+ u2" in report and "- u3" in report
     assert "passed in any run: 3; in every run: 1" in report
     assert experiments.make_run_id("Notes On!").endswith("-notes-on")
+
+
+def test_domain_notes_switch(tmp_path, monkeypatch):
+    from agent.knowledge import domain_notes
+
+    (tmp_path / "card.toml").write_text('[metadata]\ncategory = "fixed-income"\n')
+    monkeypatch.setenv("AGENT_DOMAIN_NOTES", "0")
+    assert domain_notes(tmp_path, "Bootstrap a zero coupon yield curve.") == ""
+    monkeypatch.setenv("AGENT_DOMAIN_NOTES", "1")
+    assert "fixed-income" in domain_notes(tmp_path, "Bootstrap a zero coupon yield curve.")

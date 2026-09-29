@@ -165,6 +165,11 @@ def solve_units(
 ) -> None:
     """Run the agent over every unit in a folder and summarise the results."""
     run_path = (run_dir or experiments.RUNS_DIR / experiments.make_run_id(name)).resolve()
+    run_path.mkdir(parents=True, exist_ok=True)
+    # The run keeps its own log next to its artifacts (no stray log files to manage).
+    file_log = logging.FileHandler(run_path / "run.log", encoding="utf-8")
+    file_log.setFormatter(logging.getLogger().handlers[0].formatter)
+    logging.getLogger().addHandler(file_log)
     manifest: dict = {}
 
     def on_start(units: list[Path], check_image: str | None) -> None:
