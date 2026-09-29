@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from agent.loop import ANSWER_DIRS, container_path_map
@@ -257,9 +258,12 @@ def run_unit(
     timeout_override: float | None,
     agent_image: str | None = None,
     registry: set[str] | None = None,
+    keep_inputs: bool = False,
 ) -> UnitResult:
     """Solve, check, then assess one unit against the admissibility gates."""
-    result = _execute_unit(unit_dir, run_dir, check_image, timeout_override, agent_image)
+    result = _execute_unit(
+        unit_dir, run_dir, check_image, timeout_override, agent_image, keep_inputs
+    )
     assessment = assess_unit(
         unit_dir,
         pathlib.Path(result.out_dir),
@@ -281,6 +285,7 @@ def _execute_unit(
     check_image: str | None,
     timeout_override: float | None,
     agent_image: str | None,
+    keep_inputs: bool = False,
 ) -> UnitResult:
     unit_run = run_dir / unit_dir.name
     task_dir = stage_unit(unit_dir, unit_run / "input")
@@ -310,10 +315,15 @@ def _execute_unit(
             if agent_image:  # killing the docker client does not stop the container
                 subprocess.run(["docker", "kill", container_name], capture_output=True, check=False)
             result.agent_seconds = time.perf_counter() - started
+            if not keep_inputs:
+                shutil.rmtree(task_dir, ignore_errors=True)
             result.status = "timeout"
             result.detail = f"agent exceeded card timeout {timeout:.0f}s"
             return result
     result.agent_seconds = time.perf_counter() - started
+    if not keep_inputs:
+        # The staged copy is reproducible from units/ and dominates a run's disk use.
+        shutil.rmtree(task_dir, ignore_errors=True)
 
     try:
         status = json.loads(status_file.read_text(encoding="utf-8"))
@@ -344,12 +354,16 @@ def run_units(
     timeout_override: float | None,
     limit: int | None,
     agent_image: str | None = None,
+    keep_inputs: bool = False,
+    on_start: Callable[[list[pathlib.Path], str | None], None] | None = None,
 ) -> list[UnitResult]:
     units = discover_units(units_dir, patterns)[: limit or None]
     if not units:
         raise ValueError(f"No units matched in {units_dir} (patterns={patterns or 'all'})")
     run_dir.mkdir(parents=True, exist_ok=True)
     check_image = checker_image if check and checker_available(checker_image) else None
+    if on_start is not None:
+        on_start(units, check_image)  # e.g. write the experiment manifest
     registry = canary_registry(units_dir)
     logger.info(
         "Running %d units with %d parallel job(s) into %s (agent=%s, checker=%s)",
@@ -368,7 +382,7 @@ def run_units(
             pool,
             units,
             run_dir,
-            (check_image, timeout_override, agent_image, registry),
+            (check_image, timeout_override, agent_image, registry, keep_inputs),
             results,
             results_path,
         )
@@ -391,7 +405,7 @@ def _collect(
     pool: ThreadPoolExecutor,
     units: list[pathlib.Path],
     run_dir: pathlib.Path,
-    unit_args: tuple[str | None, float | None, str | None, set[str]],
+    unit_args: tuple[str | None, float | None, str | None, set[str], bool],
     results: list[UnitResult],
     results_path: pathlib.Path,
 ) -> None:

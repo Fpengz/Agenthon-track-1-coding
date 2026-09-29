@@ -109,8 +109,11 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   team's own solutions to public units, used for OTHER units only). Excluded: same unit id, same
   instruction hash, or instruction Jaccard >= 0.5 (template re-issues such as
   `t1-momentum-backtest`/`t1-sma-crossover-spy`). GUIDs are stripped. Build/extend the library
-  with `uv run python -m agent.main build-examples tmp/runs/<run> [...]`, which harvests
+  with `uv run python -m agent.main build-examples experiments/runs/<run_id> [...]`, which harvests
   checker-passed units' accepted scripts (saved as `meta/transcripts/solution.py`).
+- `experiments.py` — run ids, manifests, the registry, `runs list/compare/prune` (host tooling;
+  standards in `experiments/README.md`: commit before runs you keep, one change per comparison,
+  >= 2 runs per variant because units flip between identical runs, same `-j` for comparisons).
 - `inputs.py` — bounded previews of each input file (CSV head + row count, Parquet schema +
   rows, JSON key skeleton, xlsx sheets, ...). Without them the model guesses column names and
   JSON keys and repeats the same `KeyError` on every repair.
@@ -163,19 +166,26 @@ uv run python -m pytest -q tests/test_base_agent.py::test_extract_python_code   
 # Run the agent locally against a unit (needs MODEL_ENDPOINT/MODEL_NAME, e.g. from .env).
 # Use a fresh --out directory every run.
 uv run agent/main.py solve --task-dir units/t1-EXAMPLE-bs-greeks-pde --out ./tmp/<fresh-dir>
+# (tmp/ is gitignored scratch for ad-hoc runs; real experiments follow experiments/README.md.)
 
 # Run the agent over many units (all by default; name globs select), N in parallel.
 # Stages each unit without checks/ and reference/ (as evaluation mounts it), runs solve in a
 # subprocess under the card's timeout, then runs the unit checker in the sandbox image if it
 # exists (as your user; inputs also mounted at their /app COPY targets and /tests/reference_data,
-# like the official scorer). Writes tmp/runs/<time>/{summary.json,results.jsonl,<unit>/{input,output,agent.log}}.
-uv run python -m agent.main solve-units -j 4
-uv run python -m agent.main solve-units 't1-EXAMPLE-*' --no-check --timeout 600
+# like the official scorer). Every run follows experiments/README.md: run id
+# <YYYYMMDD-HHMM>-<name>, manifest.json (git commit/dirty, image IDs, model, settings) and raw
+# artifacts under experiments/runs/<run_id>/ (gitignored; staged input copies deleted per unit),
+# plus one line in the tracked, append-only experiments/registry.jsonl when it finishes.
+uv run python -m agent.main solve-units -j 8 --agent-image agenthon-agent:latest \
+  --name notes-off --note "what this run tests" --baseline 20260929-0816-review-on
+uv run python -m agent.main solve-units 't1-EXAMPLE-*' --no-check --timeout 600 --no-register
+uv run python -m agent.main runs list                        # recorded runs
+uv run python -m agent.main runs compare BASE OTHER [...]    # shared-unit pass@1 + per-unit flips
+uv run python -m agent.main runs prune RUN_ID                # drop raw artifacts, keep the record
 # Faithful mode: run solve inside the agent image (as evaluation does). Prefer it for scores:
 # the local venv lacks sandbox libraries generated scripts use (statsmodels, arch, matplotlib,
 # plotly, openpyxl, ta-lib, ...), so host-mode failures can be environment artifacts.
-docker build -t agenthon-agent:dev -f Dockerfile.agent .
-uv run python -m agent.main solve-units -j 8 --agent-image agenthon-agent:dev
+docker build -t agenthon-agent:latest -f Dockerfile.agent .
 # Each run ends with competition-style metrics (agent/metrics.py; also summary.json "metrics"):
 # official mean pass@1 over the fixed denominator, g0-g3 gate estimates, official failure labels
 # (g3 label via the organizer's own classifier), pass@1 by difficulty/category, and diagnostics

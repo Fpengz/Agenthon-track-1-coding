@@ -379,3 +379,28 @@ def test_unexpected_error_after_clean_run_keeps_accepted_outputs(tmp_path, monke
     solver = _solver(tmp_path, ScriptedClient(WRITE_OK))
     assert solver.run()
     assert (tmp_path / "out" / "r.json").read_text() == '{"price": 1.5}'
+
+
+def test_experiment_registry_roundtrip_and_compare(tmp_path):
+    from agent import experiments
+
+    registry = tmp_path / "registry.jsonl"
+
+    def record(run_id, statuses):
+        summary = {
+            "units": len(statuses),
+            "units_planned": len(statuses),
+            "metrics": {"official": {"pass_at_1": None, "passed": 0}, "diagnostics": {}},
+            "results": [{"unit": u, "status": s} for u, s in statuses.items()],
+        }
+        manifest = {"run_id": run_id, "name": run_id, "note": "", "git": {"commit": "abc"}}
+        experiments.append_registry(experiments.registry_entry(manifest, summary), registry)
+
+    record("a", {"u1": "passed", "u2": "failed", "u3": "passed"})
+    record("b", {"u1": "passed", "u2": "passed", "u3": "failed", "u4": "passed"})
+    entries = [experiments.find_run(r, registry) for r in ("a", "b")]
+    report = experiments.compare(entries)
+    assert "3 units shared" in report  # u4 is not in run a
+    assert "+ u2" in report and "- u3" in report
+    assert "passed in any run: 3; in every run: 1" in report
+    assert experiments.make_run_id("Notes On!").endswith("-notes-on")

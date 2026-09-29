@@ -29,8 +29,13 @@ env/
 # Local scratch
 *.log
 /out/
-# Agent runs: solve-units outputs, staged unit copies, model transcripts, checker reports
+# Scratch (ad-hoc runs outside the experiment standard)
 /tmp/
+# Raw experiment artifacts: outputs, logs, transcripts (experiments/README.md). The registry and
+# README next to them ARE tracked.
+/experiments/runs/
+# Few-shot library of solutions to public units: goes into the image, never into a public repo
+/agent/examples/library.jsonl
 
 # Safety: never commit the proprietary, local-only folder (it lives outside repos anyway)
 proprietary-DO-NOT-PUSH/

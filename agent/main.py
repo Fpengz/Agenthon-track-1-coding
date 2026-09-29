@@ -8,13 +8,13 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from dotenv import load_dotenv
 
+from agent import experiments
 from agent.batch import run_units
 from agent.examples import LIBRARY, harvest, load_library
 from agent.loop import AgentSolver
@@ -111,10 +111,31 @@ def solve_units(
     units_dir: Annotated[
         Path, typer.Option("--units-dir", help="Folder containing unit directories.")
     ] = Path("units"),
+    name: Annotated[
+        str, typer.Option("--name", help="Short run name; the run id is <YYYYMMDD-HHMM>-<name>.")
+    ] = "run",
+    note: Annotated[
+        str, typer.Option("--note", help="What this run tests (hypothesis / change).")
+    ] = "",
+    baseline: Annotated[
+        str | None, typer.Option("--baseline", help="Run id this run should be compared with.")
+    ] = None,
     run_dir: Annotated[
         Path | None,
-        typer.Option("--run-dir", help="Where to write per-unit runs. Default: tmp/runs/<time>."),
+        typer.Option(
+            "--run-dir", help="Override the run directory (default: experiments/runs/<run_id>)."
+        ),
     ] = None,
+    keep_inputs: Annotated[
+        bool,
+        typer.Option("--keep-inputs", help="Keep each unit's staged input copy (debugging)."),
+    ] = False,
+    register: Annotated[
+        bool,
+        typer.Option(
+            "--register/--no-register", help="Record the run in experiments/registry.jsonl."
+        ),
+    ] = True,
     jobs: Annotated[int, typer.Option("--jobs", "-j", min=1, help="Units to run in parallel.")] = 1,
     check: Annotated[
         bool,
@@ -143,7 +164,25 @@ def solve_units(
     ] = None,
 ) -> None:
     """Run the agent over every unit in a folder and summarise the results."""
-    run_path = (run_dir or Path("tmp/runs") / time.strftime("%Y%m%d-%H%M%S")).resolve()
+    run_path = (run_dir or experiments.RUNS_DIR / experiments.make_run_id(name)).resolve()
+    manifest: dict = {}
+
+    def on_start(units: list[Path], check_image: str | None) -> None:
+        manifest.update(
+            experiments.write_manifest(
+                run_path,
+                name=name,
+                note=note,
+                baseline=baseline,
+                units=[u.name for u in units],
+                jobs=jobs,
+                agent_image=agent_image,
+                checker_image=check_image,
+                timeout_override=timeout,
+            )
+        )
+        logger.info("Run id %s (manifest: %s)", run_path.name, run_path / "manifest.json")
+
     try:
         run_units(
             units_dir=units_dir.expanduser().resolve(),
@@ -155,10 +194,17 @@ def solve_units(
             timeout_override=timeout,
             limit=limit,
             agent_image=agent_image,
+            keep_inputs=keep_inputs,
+            on_start=on_start,
         )
     except ValueError as exc:
         logger.error("%s", exc)
         raise typer.Exit(code=2) from exc
+    summary_path = run_path / "summary.json"
+    if register and manifest and summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        experiments.append_registry(experiments.registry_entry(manifest, summary))
+        logger.info("Recorded %s in %s", run_path.name, experiments.REGISTRY)
 
 
 @app.command("build-examples")
@@ -183,6 +229,44 @@ def build_examples(
     lines = [json.dumps(ex) for ex in sorted(existing.values(), key=lambda e: e["unit_id"])]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger.info("Library %s: %d examples (%d added or replaced)", out, len(existing), added)
+
+
+runs_app = typer.Typer(help="Inspect and manage recorded experiment runs.", no_args_is_help=True)
+app.add_typer(runs_app, name="runs")
+
+
+@runs_app.command("list")
+def runs_list(
+    last: Annotated[int, typer.Option("--last", "-n", help="Show only the latest N runs.")] = 0,
+) -> None:
+    """Recorded runs (experiments/registry.jsonl), oldest first."""
+    entries = experiments.load_registry()
+    print(experiments.format_list(entries[-last:] if last else entries))
+
+
+@runs_app.command("compare")
+def runs_compare(
+    run_ids: Annotated[
+        list[str], typer.Argument(help="Run ids (or names); the first is the baseline.")
+    ],
+) -> None:
+    """pass@1 on shared units and per-unit flips against the first run."""
+    try:
+        entries = [experiments.find_run(r) for r in run_ids]
+    except KeyError as exc:
+        logger.error("%s", exc)
+        raise typer.Exit(code=2) from exc
+    print(experiments.compare(entries))
+
+
+@runs_app.command("prune")
+def runs_prune(
+    run_ids: Annotated[list[str], typer.Argument(help="Run ids whose raw artifacts to delete.")],
+) -> None:
+    """Delete raw artifacts under experiments/runs/ (registry entries are kept)."""
+    for run_id in run_ids:
+        freed = experiments.prune_run(experiments.RUNS_DIR / run_id)
+        logger.info("Pruned %s (%.1f MB freed)", run_id, freed / 1e6)
 
 
 def main(argv: list[str] | None = None) -> int:
