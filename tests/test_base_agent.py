@@ -417,3 +417,78 @@ def test_domain_notes_switch(tmp_path, monkeypatch):
     assert domain_notes(tmp_path, "Bootstrap a zero coupon yield curve.") == ""
     monkeypatch.setenv("AGENT_DOMAIN_NOTES", "1")
     assert "fixed-income" in domain_notes(tmp_path, "Bootstrap a zero coupon yield curve.")
+
+
+def test_compare_outputs_tolerance_and_diffs(tmp_path):
+    from agent.consensus import compare_outputs
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    (a / "t.csv").write_text("id,v\nx,1.0000\ny,2.0\n")
+    (b / "t.csv").write_text("id,v\nx,1.0001\ny,2.0\n")  # within tolerance
+    (a / "r.json").write_text('{"price": 1.5, "n": 3}')
+    (b / "r.json").write_text('{"price": 1.5, "n": 3}')
+    assert compare_outputs(a, b).agree
+    (b / "r.json").write_text('{"price": 2.5, "n": 3}')
+    disagreement = compare_outputs(a, b)
+    assert not disagreement.agree
+    assert any("r.json:price" in d for d in disagreement.diffs)
+
+
+def _writer(price):
+    return WRITE_OK.replace("1.5", str(price))
+
+
+def test_consensus_accepts_agreeing_candidates(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CANDIDATES", 3)
+    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", _writer(1.5))
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 3  # A, A's review, B (agrees -> no C, no judge)
+    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 1.5}'
+
+
+def test_consensus_majority_overrules_candidate_a(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CANDIDATES", 3)
+    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", _writer(2.5), _writer(2.5))
+    assert _solver(tmp_path, client).run()
+    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 2.5}'  # B and C agree
+
+
+def test_consensus_judge_settles_two_disagreeing_candidates(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CANDIDATES", 2)
+    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", _writer(2.5), "B is right.\nCHOICE: B")
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 4
+    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 2.5}'
+
+
+def test_consensus_candidate_cannot_clobber_accepted_outputs(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CANDIDATES", 2)
+    crash_after_write = WRITE_OK.replace(
+        "'{\"price\": 1.5}')", "'{\"price\": 9}'); raise SystemExit(1)"
+    )
+    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", *[crash_after_write] * 8)
+    assert _solver(tmp_path, client).run()
+    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 1.5}'  # B wrote only to staging
+
+
+def test_consensus_medoid_picks_the_most_supported_candidate(tmp_path, monkeypatch):
+    from agent import loop
+
+    def writer(p, q):
+        return WRITE_OK.replace('{"price": 1.5}', f'{{"p": {p}, "q": {q}}}')
+
+    monkeypatch.setattr(loop, "CANDIDATES", 3)
+    # A-B agree on p, B-C agree on q, A-C on nothing: B has the most support.
+    client = ScriptedClient(writer(1, 1), "VERDICT: PASS", writer(1, 2), writer(3, 2))
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 4  # no judge needed with three candidates
+    assert (tmp_path / "out" / "r.json").read_text() == '{"p": 1, "q": 2}'

@@ -288,3 +288,37 @@ Reply with `VERDICT: PASS` if you find no concrete problem. Otherwise reply with
 `VERDICT: FAIL`, at most 8 one-line bullets naming the concrete problems, {fix_form}
 Report only real, specific defects.
 """
+
+
+def build_judge_prompt(task_prompt: str, diffs: list[str], code_a: str, code_b: str) -> str:
+    """Ask which of two disagreeing candidate solutions follows the specification.
+
+    Scripts are included only when given (the caller drops them if the request would not fit).
+    """
+    diffs_str = "\n".join(f"- {d}" for d in diffs) or "- (outputs differ)"
+    scripts = ""
+    if code_a and code_b:
+        scripts = f"""
+### CANDIDATE A SCRIPT:
+```python
+{code_a}
+```
+
+### CANDIDATE B SCRIPT:
+```python
+{code_b}
+```
+"""
+    return f"""{task_prompt}
+
+---
+Two independently written scripts for this task both ran cleanly but produced DIFFERENT outputs.
+Exactly one of them should be submitted.
+
+### WHERE THE OUTPUTS DISAGREE:
+{diffs_str}
+{scripts}
+Decide which candidate follows the TASK SPECIFICATION (definitions, conventions, units, edge
+cases) more faithfully for the values that disagree. Think briefly, then end your reply with a
+single line: `CHOICE: A` or `CHOICE: B`.
+"""

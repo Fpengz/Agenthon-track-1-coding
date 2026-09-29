@@ -34,7 +34,8 @@ it): it is reproducible from `units/` and was most of a run's disk use.
    flag; a dirty run cannot be reproduced from the commit and is marked `*` in `runs list`.
    It also records the Docker image *ID* (tags get rebuilt), the checker image, the served model,
    every behaviour setting (`HOUSE_REASONING`, `AGENT_MAX_REVIEWS`, `AGENT_TIME_BUDGET_SEC`,
-   `HOUSE_CONTEXT_TOKENS`, `HOUSE_REQUEST_TIMEOUT`, `AGENT_DOMAIN_NOTES`), `-j`, and the unit
+   `HOUSE_CONTEXT_TOKENS`, `HOUSE_REQUEST_TIMEOUT`, `AGENT_DOMAIN_NOTES`, `AGENT_CANDIDATES`), `-j`,
+   and the unit
    list. Each run also keeps its own `run.log`.
 
 3. **Change one thing per comparison**, and name the run it is compared with (`--baseline`).

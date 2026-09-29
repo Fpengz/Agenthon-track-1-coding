@@ -8,10 +8,12 @@ import pathlib
 import re
 import tempfile
 import time
+from dataclasses import dataclass
 
 from openai.types.chat import ChatCompletionMessageParam
 
 from agent.client import MAX_OUTPUT_TOKENS, HouseModelClient
+from agent.consensus import compare_outputs
 from agent.examples import format_example, select_example
 from agent.executor import (
     apply_edits,
@@ -26,6 +28,7 @@ from agent.prompts import (
     SYSTEM_PROMPT,
     build_continuation_prompt,
     build_initial_prompt,
+    build_judge_prompt,
     build_no_code_prompt,
     build_repair_prompt,
     build_review_prompt,
@@ -57,6 +60,19 @@ CARD_TIMEOUT_SHARE = 0.85
 DEFAULT_CARD_TIMEOUT_SEC = 1800.0
 MIN_ATTEMPT_SEC = 60.0  # do not start an attempt (request + run) with less time than this
 MIN_EXEC_TIMEOUT_SEC = 30
+# Best-of-N consensus (agent/consensus.py). AGENT_CANDIDATES=1 keeps the single-candidate loop.
+# With more, candidate A (the full loop, with review) runs first, leaving a small reserve of the
+# time budget; later candidates are independent solves (fresh prompt, sampled, no review, few
+# attempts) into their own staging directory. A near-identical pair ends the search early;
+# otherwise, with 3+ candidates the medoid (highest total agreement with the others) is
+# submitted, and with 2 a judge request decides. Independent solutions rarely agree exactly
+# (smoke run: pairwise agreement 0.40-0.91), so the medoid uses partial agreement as evidence.
+CANDIDATES = max(1, int(os.environ.get("AGENT_CANDIDATES", "1")))
+CANDIDATE_RESERVE_SHARE = 0.3  # at most this share of the budget is held back from candidate A
+CANDIDATE_ATTEMPTS = 6
+CANDIDATE_TEMPERATURE = 0.7
+CANDIDATE_MIN_SEC = 120.0
+_CHOICE = re.compile(r"CHOICE:\s*\**\s*([AB])\b")
 # Repairs/reviews of scripts at least this long ask for SEARCH/REPLACE edits, not a rewrite.
 EDIT_MODE_MIN_LINES = 80
 # Context guard. The House route documents no serving window, and an over-long request is
@@ -164,6 +180,16 @@ def container_path_map(task_dir: pathlib.Path) -> list[tuple[str, str]]:
                 target = f"{dest.rstrip('/')}/{src_path.name}" if into_dir else dest
                 mapping.append((target, src_path.relative_to(task_dir).as_posix()))
     return mapping
+
+
+@dataclass(frozen=True)
+class _PromptParts:
+    """Everything the task prompt is built from, so it can be rebuilt for another OUTPUT_DIR."""
+
+    instruction_text: str
+    discovered_files: list[str]
+    path_map: list[tuple[str, str]]
+    optional: dict[str, str]  # dropped in _DROP_ORDER when a request would not fit
 
 
 class AgentSolver:
@@ -327,23 +353,19 @@ class AgentSolver:
         path_map = container_path_map(self.task_dir)
         if path_map:
             logger.info("Resolved %d container path(s) from environment/Dockerfile", len(path_map))
-        optional = {
-            "input_previews": build_input_previews(self.task_dir, input_files),
-            "domain_notes": domain_notes(self.task_dir, instruction_text),
-            "reference_example": format_example(select_example(self.task_dir, instruction_text)),
-        }
-        # Task prompts from richest to leanest; the context guard falls back along this list.
-        prompt_variants = [
-            build_initial_prompt(
-                instruction_text=instruction_text,
-                task_dir=str(self.task_dir),
-                out_dir=str(self.out_dir),
-                discovered_files=relative_inputs,
-                path_map=path_map,
-                **{k: v for k, v in optional.items() if k not in dropped},
-            )
-            for dropped in _DROP_ORDER
-        ]
+        self._prompt_parts = _PromptParts(
+            instruction_text=instruction_text,
+            discovered_files=relative_inputs,
+            path_map=path_map,
+            optional={
+                "input_previews": build_input_previews(self.task_dir, input_files),
+                "domain_notes": domain_notes(self.task_dir, instruction_text),
+                "reference_example": format_example(
+                    select_example(self.task_dir, instruction_text)
+                ),
+            },
+        )
+        prompt_variants = self._prompt_variants(self.out_dir)
         initial_prompt = prompt_variants[0]
         logger.info(
             "Prepared initial prompt (system_chars=%d, user_chars=%d)",
@@ -352,24 +374,45 @@ class AgentSolver:
         )
 
         with tempfile.TemporaryDirectory(prefix="agent-work-") as work_dir:
+            if CANDIDATES > 1:
+                return self._solve_with_consensus(expected_deliverables, pathlib.Path(work_dir))
             return self._solve_loop(
                 prompt_variants=prompt_variants,
                 expected_deliverables=expected_deliverables,
                 work_dir=pathlib.Path(work_dir),
             )
 
+    def _prompt_variants(self, out_dir: pathlib.Path) -> list[str]:
+        """Task prompts from richest to leanest; the context guard falls back along this list."""
+        parts = self._prompt_parts
+        return [
+            build_initial_prompt(
+                instruction_text=parts.instruction_text,
+                task_dir=str(self.task_dir),
+                out_dir=str(out_dir),
+                discovered_files=parts.discovered_files,
+                path_map=parts.path_map,
+                **{k: v for k, v in parts.optional.items() if k not in dropped},
+            )
+            for dropped in _DROP_ORDER
+        ]
+
     def _solve_loop(
         self,
         prompt_variants: list[str],
         expected_deliverables: list[str],
         work_dir: pathlib.Path,
+        temperature: float = 0.0,
+        max_reviews: int = MAX_REVIEWS,
+        max_attempts: int | None = None,
     ) -> bool:
+        """Generate, run and repair until a clean run is accepted; False if none was."""
         initial_prompt = prompt_variants[0]
+        attempts = max_attempts or self.max_retries + 1
         # The conversation is rebuilt each turn instead of accumulated: the latest repair
         # prompt already carries the previous code and error, and replaying the model's
         # inline reasoning would overflow the House model's 32k context within a few turns.
         user_prompt = initial_prompt
-        temperature = 0.0
         partial_code = ""  # prefix of a script cut off at the output cap, while continuing it
         continuations = 0
         reviews = 0
@@ -386,11 +429,11 @@ class AgentSolver:
 
         # Iterative execution & self-repair loop
         try:
-            for attempt in range(1, self.max_retries + 2):
+            for attempt in range(1, attempts + 1):
                 if self._time_left() < MIN_ATTEMPT_SEC:
                     logger.warning("Time budget exhausted before attempt %d; stopping", attempt)
                     break
-                logger.info("Attempt %d/%d: Calling House Model...", attempt, self.max_retries + 1)
+                logger.info("Attempt %d/%d: Calling House Model...", attempt, attempts)
                 messages: list[ChatCompletionMessageParam] = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -559,7 +602,7 @@ class AgentSolver:
                         self.client, "request_count", 0
                     )
                     review_deadline = REVIEW_DEADLINE_SHARE * self.time_budget
-                    if reviews >= MAX_REVIEWS or elapsed > review_deadline or requests_left < 2:
+                    if reviews >= max_reviews or elapsed > review_deadline or requests_left < 2:
                         return self._accept(attempt, "no review budget left", reviewed_code)
                     # Exit code 0 and present files say nothing about correctness: ask the model
                     # to verify the outputs against the specification before accepting them.
@@ -582,7 +625,7 @@ class AgentSolver:
                         "Clean run on attempt %d; requesting review %d/%d (%d automatic findings)",
                         attempt,
                         reviews,
-                        MAX_REVIEWS,
+                        max_reviews,
                         len(findings),
                     )
                     continue
@@ -639,7 +682,7 @@ class AgentSolver:
         if have_accepted:
             # A review "fix" failed to produce a clean run: fall back to the last clean outputs.
             restore_outputs(accepted_dir, self.out_dir)
-            return self._accept(self.max_retries + 1, "restored the last clean run", reviewed_code)
+            return self._accept(attempts, "restored the last clean run", reviewed_code)
         logger.error("Agent run stopped without producing all verified deliverables.")
         logger.info(
             "Agent run summary: status=failed, model_requests=%s, output_dir=%s",
@@ -649,6 +692,20 @@ class AgentSolver:
         return False
 
     def _accept(self, attempt: int, reason: str, code: str) -> bool:
+        self.accepted_code = code
+        self._save_solution(code)
+        logger.info(
+            "Task completed on attempt %d (%s; verified_outputs=%s, model_requests=%s, "
+            "output_dir=%s)",
+            attempt,
+            reason,
+            [p.name for p in output_files(self.out_dir)],
+            getattr(self.client, "request_count", "unknown"),
+            self.out_dir,
+        )
+        return True
+
+    def _save_solution(self, code: str) -> None:
         # With transcripts on (local batch runs), keep the accepted script: checker-passed ones
         # become few-shot examples for OTHER units (agent.main build-examples).
         transcript_dir = os.environ.get("AGENT_TRANSCRIPT_DIR")
@@ -659,13 +716,144 @@ class AgentSolver:
                 (path / "solution.py").write_text(code, encoding="utf-8")
             except OSError:
                 logger.debug("Could not save the accepted script", exc_info=True)
+
+    # ------------------------------------------------------------------ best-of-N consensus
+
+    def _requests_left(self) -> int:
+        return getattr(self.client, "max_requests", 0) - getattr(self.client, "request_count", 0)
+
+    def _run_candidate(
+        self, label: str, expected: list[str], work_dir: pathlib.Path
+    ) -> tuple[str, str, pathlib.Path] | None:
+        """An independent solve into its own staging directory: ``(label, code, snapshot)``.
+
+        The prompt names the staging directory, so even a script that hardcodes the path shown
+        cannot overwrite the accepted deliverables in the real output directory.
+        """
+        staging = work_dir / f"out-{label}"
+        staging.mkdir(parents=True, exist_ok=True)
+        real_out = self.out_dir
+        self.out_dir = staging
+        try:
+            logger.info("Consensus: solving independent candidate %s", label)
+            ok = self._solve_loop(
+                self._prompt_variants(staging),
+                expected,
+                work_dir / f"work-{label}",
+                temperature=CANDIDATE_TEMPERATURE,
+                max_reviews=0,
+                max_attempts=CANDIDATE_ATTEMPTS,
+            )
+        finally:
+            self.out_dir = real_out
+        if not ok:
+            logger.info("Consensus: candidate %s produced no clean run", label)
+            return None
+        snapshot = work_dir / f"candidate-{label}"
+        snapshot_outputs(staging, snapshot)
+        return label, self.accepted_code, snapshot
+
+    def _judge(
+        self, a: tuple[str, str, pathlib.Path], b: tuple[str, str, pathlib.Path], diffs: list[str]
+    ) -> tuple[str, str, pathlib.Path]:
+        """One request: which of two disagreeing candidates follows the spec. Defaults to ``a``."""
+        if self._requests_left() < 1 or self._time_left() < MIN_ATTEMPT_SEC:
+            return a
+        variants = self._prompt_variants(self.out_dir)
+        prompt = build_judge_prompt(variants[0], diffs, a[1], b[1])
+        fitted = fit_to_context(prompt, variants[0], variants)
+        if fitted is None or fitted[2] < MAX_OUTPUT_TOKENS:
+            # Too long with both scripts: judge on the disagreeing values alone.
+            fitted = fit_to_context(
+                build_judge_prompt(variants[0], diffs, "", ""), variants[0], variants
+            )
+        if fitted is None:
+            return a
+        try:
+            result = self.client.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": fitted[0]},
+                ],
+                temperature=0.0,
+                max_tokens=fitted[2],
+            )
+        except Exception:
+            logger.exception("Consensus judge request failed; keeping candidate %s", a[0])
+            return a
+        choices = _CHOICE.findall(result.content)
+        choice = b if choices and choices[-1] == "B" else a
+        logger.info("Consensus judge chose candidate %s (%s vs %s)", choice[0], a[0], b[0])
+        return choice
+
+    def _solve_with_consensus(self, expected: list[str], work_dir: pathlib.Path) -> bool:
+        """Best-of-N: accept agreeing independent solutions; settle disagreements."""
+        full_deadline = self.deadline
+        # Candidate A: the full loop (repairs + review). Only a small reserve is held back:
+        # cutting A short costs units that the single loop solves late (smoke run).
+        reserve = min(
+            CANDIDATE_MIN_SEC * (CANDIDATES - 1), CANDIDATE_RESERVE_SHARE * self._time_left()
+        )
+        self.deadline = full_deadline - reserve
+        try:
+            ok_a = self._solve_loop(
+                self._prompt_variants(self.out_dir), expected, work_dir / "work-A"
+            )
+        finally:
+            self.deadline = full_deadline
+        candidates: list[tuple[str, str, pathlib.Path]] = []
+        if ok_a:
+            snapshot_outputs(self.out_dir, work_dir / "candidate-A")
+            candidates.append(("A", self.accepted_code, work_dir / "candidate-A"))
+
+        decided: tuple[str, str, pathlib.Path] | None = None
+        agreement: dict[tuple[str, str], float] = {}
+        for label in "BCDE"[: CANDIDATES - 1]:
+            if self._time_left() < CANDIDATE_MIN_SEC or self._requests_left() < 3:
+                logger.info("Consensus: no budget for candidate %s", label)
+                break
+            candidate = self._run_candidate(label, expected, work_dir)
+            if candidate is None:
+                continue
+            # A near-identical pair is strong evidence: stop early and submit the earlier one.
+            for earlier in candidates:
+                result = compare_outputs(earlier[2], candidate[2])
+                agreement[(earlier[0], candidate[0])] = result.score
+                logger.info(
+                    "Consensus: %s vs %s agreement %.3f", earlier[0], candidate[0], result.score
+                )
+                if result.agree:
+                    decided = earlier
+                    break
+            candidates.append(candidate)
+            if decided is not None:
+                break
+
+        if decided is None and len(candidates) >= 3:
+            # Medoid: the candidate that agrees most with all the others (earliest on ties).
+            def support(c: tuple[str, str, pathlib.Path]) -> float:
+                return sum(v for pair, v in agreement.items() if c[0] in pair)
+
+            decided = max(candidates, key=support)
+            logger.info(
+                "Consensus medoid: %s (support %s)",
+                decided[0],
+                {c[0]: round(support(c), 3) for c in candidates},
+            )
+        elif decided is None and len(candidates) == 2:
+            first, second = candidates
+            decided = self._judge(first, second, compare_outputs(first[2], second[2]).diffs)
+        elif decided is None and candidates:
+            decided = candidates[0]  # a single clean candidate (the others failed)
+        if decided is None:
+            logger.error("Consensus: no candidate produced a clean run")
+            return False
+        restore_outputs(decided[2], self.out_dir)
+        self._save_solution(decided[1])
         logger.info(
-            "Task completed on attempt %d (%s; verified_outputs=%s, model_requests=%s, "
-            "output_dir=%s)",
-            attempt,
-            reason,
-            [p.name for p in output_files(self.out_dir)],
+            "Consensus: submitted candidate %s of %s (model_requests=%s)",
+            decided[0],
+            [c[0] for c in candidates],
             getattr(self.client, "request_count", "unknown"),
-            self.out_dir,
         )
         return True

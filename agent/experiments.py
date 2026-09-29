@@ -35,6 +35,7 @@ SETTING_VARS = (
     "HOUSE_CONTEXT_TOKENS",
     "HOUSE_REQUEST_TIMEOUT",
     "AGENT_DOMAIN_NOTES",
+    "AGENT_CANDIDATES",
 )
 _SLUG = re.compile(r"[^a-z0-9]+")
 

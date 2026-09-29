@@ -82,6 +82,16 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   part is first trimmed to its last complete logical line via `tokenize`, otherwise a cut inside
   a multi-line bracket makes the continuation restart it and leaves it unclosed); a
   response cut off before any code is handed back as "previous analysis".
+- `consensus.py` + `_solve_with_consensus` (`loop.py`) — best-of-N, `AGENT_CANDIDATES` (default 1
+  = off). Candidate A is the full loop (repairs + review), holding back a small reserve (<= 30% of
+  the budget) for the others; B, C... are
+  independent solves (fresh prompt, temperature 0.7, no review, <= 6 attempts) into their own
+  staging OUTPUT_DIR (so a hardcoded path cannot clobber accepted outputs). Outputs are compared
+  (numbers within rtol 5e-3, JSON by key path, charts by existence); a near-identical pair
+  (>= 0.95) ends the search; otherwise 3+ candidates submit the medoid (most total agreement) and
+  2 use a judge request. Independent solutions rarely agree exactly (0.40-0.91 in a smoke run);
+  consensus runs need a larger AGENT_TIME_BUDGET_SEC. Motivation: 12 units
+  pass in some runs and fail in others; locking them in would take pass@1 from 0.15 to ~0.23.
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt
