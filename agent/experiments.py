@@ -60,7 +60,14 @@ def _run(cmd: list[str]) -> str:
 
 
 def git_state() -> dict[str, Any]:
-    status = _run(["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=no"])
+    # The registry is the experiment log, not code: runs appending to it must not make every
+    # later run look unreproducible.
+    status = _run(
+        [
+            "git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=no",
+            "--", ".", ":(exclude)experiments/registry.jsonl",
+        ]
+    )  # fmt: skip
     return {
         "commit": _run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"]) or None,
         "branch": _run(["git", "-C", str(REPO_ROOT), "branch", "--show-current"]) or None,
