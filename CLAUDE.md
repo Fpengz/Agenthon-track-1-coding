@@ -107,9 +107,11 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   uncaught exception it prints an `[agent]` block (failure type, failing line, DataFrame
   columns/shape/index, dict keys, array shapes of the variables in scope). 28% of failures used
   to repeat the previous error. Repair prompts start with `Failure type: ...`.
-- Other switches, all default off until A/B-tested: `AGENT_EXAMPLES` (few-shot library),
-  `AGENT_STRUCTURED` (one function per deliverable, failures isolated and reported together),
-  `HOUSE_REASONING=low`.
+- Experimental switches, all OFF (A/B-tested, not adopted; code kept): `AGENT_SPEC_CHECKS`
+  (0.157-0.180 vs control), `AGENT_EXAMPLES` (few-shot library; 0.157), `AGENT_STRUCTURED` (one
+  function per deliverable; 0.163), `AGENT_CANDIDATES` (consensus; same gain as low reasoning at
+  12.7 requests / 521 s per unit, over the roster budget), `AGENT_DOMAIN_NOTES` (0.140 vs 0.157).
+  Results per run are in `experiments/registry.jsonl`.
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt
@@ -168,9 +170,12 @@ Generate → execute → self-repair loop, one House-model request per attempt:
 
 - Served model is NVIDIA Nemotron-3 Super via vLLM with a **32,768-token context**. Reasoning is
   emitted inline in `content`, terminated by `</think>` (no opening tag, no reasoning parser).
-- With reasoning on, responses routinely spend the whole 4,000-token cap on reasoning and emit no
-  code, so reasoning is **off by default**: `HOUSE_REASONING=off|low|on` maps to
-  `chat_template_kwargs` `{"enable_thinking": false}` / `{"low_effort": true}` / server default.
+- With full reasoning, responses routinely spend the whole 4,000-token cap on reasoning and emit
+  no code. `HOUSE_REASONING=low|off|on` (default **low**) maps to `chat_template_kwargs`
+  `{"low_effort": true}` / `{"enable_thinking": false}` / server default. `low` won two parallel
+  A/Bs (4 runs 16-19/86 vs 15-17 without it; no-output failures halved; ~20% fewer requests). If a
+  reply shows low effort is not honoured (> 4,000 reasoning chars, or cut off before any code),
+  the client falls back to `off` for the rest of the unit.
   The hub's `docs/HOUSE-MODEL.md` documents `enable_thinking` as the thinking control and says the
   route forwards `low_effort` and `reasoning_budget` untested; `reasoning_budget` had no effect on
   the local vLLM.

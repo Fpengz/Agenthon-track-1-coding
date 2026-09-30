@@ -633,3 +633,18 @@ def test_spec_value_checks_and_false_positive_guards(tmp_path):
     assert "prices.csv: column 'price' must be numeric" in problems and "'abc'" in problems
     assert "summary.json: key 'n' must be a number" in problems
     assert "weights" not in problems
+
+
+def test_low_effort_falls_back_to_off_when_not_honoured(monkeypatch):
+    from agent.client import HouseModelClient
+
+    monkeypatch.delenv("HOUSE_REASONING", raising=False)
+    client = HouseModelClient(base_url="http://127.0.0.1:9", model_name="x")
+    assert client.reasoning_mode == "low"  # the default
+    client._check_low_effort("Brief plan.\n</think>\n```python\nprint(1)\n```", "stop")
+    assert client.reasoning_mode == "low"  # honoured: short reasoning
+    client._check_low_effort("thinking " * 1000 + "</think>\n```python\nx\n```", "stop")
+    assert client.reasoning_mode == "off"  # long reasoning: not honoured
+    client.reasoning_mode = "low"
+    client._check_low_effort("still thinking about the approach", "length")
+    assert client.reasoning_mode == "off"  # cut off before any code

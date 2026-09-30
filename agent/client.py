@@ -35,17 +35,23 @@ class ChatResult:
 
 
 # Reasoning modes, sent as chat_template_kwargs (the House route forwards them; see the hub's
-# docs/HOUSE-MODEL.md). With thinking on, the model routinely spends the whole 4,000-token
-# output cap on inline reasoning and never emits code, so it is off by default.
+# docs/HOUSE-MODEL.md). Full thinking routinely spends the whole 4,000-token output cap on inline
+# reasoning and never emits code.
+#   low: low_effort=true      -- brief reasoning (DEFAULT). Two parallel A/Bs, 4 runs vs 6:
+#        mean pass@1 0.205 vs ~0.182, no-output failures halved, ~20% fewer requests. The
+#        organizers forward it but mark it untested, hence the fallback below.
 #   off: enable_thinking=false -- documented by the organizers as the thinking control
-#   low: low_effort=true      -- brief reasoning; forwarded but marked untested by the organizers
 #   on:  server default (full reasoning)
 REASONING_MODES: dict[str, dict[str, Any] | None] = {
     "off": {"enable_thinking": False},
     "low": {"low_effort": True},
     "on": None,
 }
-DEFAULT_REASONING_MODE = "off"
+DEFAULT_REASONING_MODE = "low"
+# If "low" is not honoured (a reply reasons at length, or is cut off before any code), the
+# client drops to "off" -- the documented control -- for the rest of the unit. Honoured low
+# effort reasons for ~200 characters.
+LOW_EFFORT_MAX_REASONING_CHARS = 4000
 # Per-request HTTP timeout: a stalled call must not eat the unit's card time (the SDK default is
 # 10 minutes). A full 4,000-token reply takes ~25-50 s locally.
 REQUEST_TIMEOUT_SEC = float(os.environ.get("HOUSE_REQUEST_TIMEOUT", "300"))
@@ -223,7 +229,23 @@ class HouseModelClient:
             choice.finish_reason,
         )
         self._save_transcript(messages, content, choice.finish_reason)
+        self._check_low_effort(content, choice.finish_reason)
         return ChatResult(content=content, finish_reason=choice.finish_reason)
+
+    def _check_low_effort(self, content: str, finish_reason: str | None) -> None:
+        """Fall back from "low" to "off" when a reply shows low effort was not applied."""
+        if self.reasoning_mode != "low":
+            return
+        reasoning = content.split("</think>", 1)[0] if "</think>" in content else ""
+        cut_off_without_code = finish_reason == "length" and "```" not in content
+        if len(reasoning) > LOW_EFFORT_MAX_REASONING_CHARS or cut_off_without_code:
+            logger.warning(
+                "low_effort does not seem to be honoured (reasoning %d chars, finish_reason=%s); "
+                "switching to reasoning=off for the rest of this unit",
+                len(reasoning),
+                finish_reason,
+            )
+            self.reasoning_mode = "off"
 
     def _save_transcript(
         self, messages: list[ChatCompletionMessageParam], content: str, finish_reason: str | None
