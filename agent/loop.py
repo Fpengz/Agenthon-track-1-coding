@@ -29,6 +29,7 @@ from agent.executor import (
 )
 from agent.inputs import build_input_previews
 from agent.knowledge import domain_notes, read_card
+from agent.preflight import preflight
 from agent.prompts import (
     SYSTEM_PROMPT,
     VERIFY_REPAIR_HEADLINE,
@@ -672,6 +673,26 @@ class AgentSolver:
                     len(code.splitlines()),
                 )
 
+                # Static checks first (no request, no run): certain failures are repaired without
+                # executing, and every problem is reported at once instead of the first only.
+                blocking, advisory = preflight(code, self.task_dir)
+                if blocking:
+                    logger.warning("Static check failed before running: %s", blocking[:3])
+                    continuations = 0
+                    last_failed_code = code
+                    edit_base = code
+                    user_prompt = build_repair_prompt(
+                        edit_mode=_edit_mode(code),
+                        task_prompt=initial_prompt,
+                        previous_code=code,
+                        error_message="Failure type: static check (found before running)\n"
+                        + "\n".join(blocking + advisory),
+                        out_dir=str(self.out_dir),
+                        headline="Your script was not run: static checks found errors that "
+                        "would make it fail.",
+                    )
+                    continue
+
                 # Execute code in a scratch directory; deliverables go to out_dir.
                 self.clear_stale_deliverables(expected_deliverables)
                 started_at = time.time()
@@ -837,6 +858,10 @@ class AgentSolver:
                     )
                 else:
                     err_msg = f"Failure type: {exec_result.failure_kind}\n{exec_result.feedback}"
+                if advisory:
+                    err_msg += "\nStatic analysis also found (fix these too):\n" + "\n".join(
+                        f"- {a}" for a in advisory
+                    )
 
                 continuations = 0
                 last_failed_code = code

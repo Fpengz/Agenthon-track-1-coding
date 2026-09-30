@@ -11,8 +11,9 @@ FROM finance-bench-sandbox:latest
 # Install the OpenAI-compatible client and the CLI framework used by agent.main.
 # Pinned to the versions in uv.lock (what local runs test). openai==1.40.0 crashed on client
 # construction against the base image's httpx 0.28 ("unexpected keyword argument 'proxies'"),
-# so every unit would have failed before its first House request.
-RUN pip install --no-cache-dir openai==3.19.2 python-dotenv==1.2.3 typer==0.27.2
+# so every unit would have failed before its first House request. pyflakes: pre-execution checks
+# (agent/preflight.py).
+RUN pip install --no-cache-dir openai==3.19.2 python-dotenv==1.2.3 typer==0.27.2 pyflakes==4.0.0
 
 # Set up application workspace
 WORKDIR /app

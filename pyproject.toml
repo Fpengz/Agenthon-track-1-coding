@@ -37,6 +37,7 @@ dependencies = [
   "torchaudio==2.11.0",
   "torchvision==0.28.0",
   "vllm>=0.30.0",
+  "pyflakes>=4.0.0",
 ]
 
 [project.scripts]

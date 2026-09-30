@@ -101,6 +101,13 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   disqualification. Instructions are sanitised before prompting, and every clean run's
   deliverables are scanned: a leak is never snapshotted or accepted (repair turn instead). The
   prompt gets an allow-list of card facts (category, difficulty, data cutoff, time limit, compute).
+- `preflight.py` (always on) — static checks before a script runs (no request): BLOCKING =
+  certain failures (syntax/indentation errors; module-level imports, outside try blocks, of
+  modules neither installed nor shipped as .py in TASK_DIR) -> repaired without running;
+  ADVISORY = likely bugs that may sit on paths never executed (pyflakes undefined names, `/app/`
+  unit-image paths, pandas-3-removed APIs) -> appended to a failed run's feedback. Validated
+  inside the agent image: 0 blocking flags on 2,781 scripts that ran cleanly (undefined names
+  were 1.7%, which is why they only advise). Needs pyflakes (pinned in `Dockerfile.agent`).
 - `error_context.py` (always on) — `sitecustomize.py` written next to each script: on an
   uncaught exception it prints an `[agent]` block (failure type, failing line, DataFrame
   columns/shape/index, dict keys, array shapes of the variables in scope). 28% of failures used

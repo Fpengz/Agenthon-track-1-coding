@@ -3331,6 +3331,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyflakes"
+version = "4.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/07/587d938ce8ffea54aa23337c4a827a72c27a3a994b4346899682704af588/pyflakes-4.0.0.tar.gz", hash = "sha256:492b27735181e3d4a6acfc08738948b666bf3e696781854ea6e0d8540d566d52", size = 66927, upload-time = "2026-09-22T22:37:01.881Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3e/f3/2664f53ab17a9249c58317a00aabf76acdd18d4b1b98b3a0a36af7763950/pyflakes-4.0.0-py2.py3-none-any.whl", hash = "sha256:0f7b7a78e8fcffd78b205200f045a70911f4179be1b42eac82c3323e0bf5c8aa", size = 65907, upload-time = "2026-09-22T22:37:00.744Z" },
+]
+
+[[package]]
 name = "pygments"
 version = "2.21.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3539,6 +3548,7 @@ dependencies = [
     { name = "openai" },
     { name = "pandas" },
     { name = "pyarrow" },
+    { name = "pyflakes" },
     { name = "pytest" },
     { name = "python-dotenv" },
     { name = "qfbench2-common" },
@@ -3561,6 +3571,7 @@ requires-dist = [
     { name = "openai", specifier = ">=3.19.2" },
     { name = "pandas", specifier = ">=2.1" },
     { name = "pyarrow", specifier = ">=15" },
+    { name = "pyflakes", specifier = ">=4.0.0" },
     { name = "pytest", specifier = ">=8.2" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },
     { name = "qfbench2-common", git = "https://github.com/Agenthon-2026/Agenthon2026-public.git?subdirectory=common&tag=v2.4.3" },

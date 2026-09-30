@@ -789,3 +789,35 @@ def test_first_exploration_wins_over_a_script_in_the_same_reply(tmp_path, monkey
     assert _solver(tmp_path, client).run()
     assert "42" in client.prompts[1]
     assert _out(tmp_path) == '{"price": 1.5}'  # the pre-exploration script was not used
+
+
+def test_preflight_blocks_certain_failures_and_advises_on_likely_bugs(tmp_path):
+    from agent.preflight import preflight
+
+    blocking, _ = preflight("def f(:\n    pass\n")
+    assert blocking and "SyntaxError" in blocking[0]
+    blocking, _ = preflight("import not_a_real_module_xyz\n")
+    assert blocking and "not_a_real_module_xyz" in blocking[0]
+    (tmp_path / "helper_mod.py").write_text("X = 1\n")
+    assert preflight("import helper_mod\n", tmp_path)[0] == []  # shipped with the task
+    assert (
+        preflight("try:\n    import not_a_real_module_xyz\nexcept ImportError:\n    pass\n")[0]
+        == []
+    )
+    blocking, advisory = preflight(
+        "import pandas as pd\ndef g():\n    return undefined_thing\n"
+        "p = '/app/data/x.csv'\ndf = pd.DataFrame().fillna(method='ffill')\n"
+    )
+    assert blocking == []
+    text = "\n".join(advisory)
+    assert "undefined name 'undefined_thing'" in text and "/app/data/x.csv" in text
+    assert "fillna(method" in text
+
+
+def test_static_failure_is_repaired_without_running(tmp_path):
+    broken = "```python\nimport os\nif True\n    pass\n```"
+    client = ScriptedClient(broken, WRITE_OK, "VERDICT: PASS")
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 3
+    assert "static check (found before running)" in client.prompts[1]
+    assert _out(tmp_path) == '{"price": 1.5}'
