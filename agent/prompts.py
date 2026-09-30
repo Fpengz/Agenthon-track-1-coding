@@ -59,10 +59,11 @@ CRITICAL OPERATING RULES:
 
 _MAX_PATH_MAP_LINES = 40
 
-EXPLORE_INSTRUCTION = """5. Tool: before the final script you may run up to {k} short exploration snippets (inspect the
-   data, test a formula, check a library call). To run one, reply with ONLY a ```explore ... ```
-   block of Python (read TASK_DIR; print what you need; do not write deliverables); its output
-   comes back to you. When ready, reply with the final ```python ... ``` script.
+EXPLORE_INSTRUCTION = """5. Tool: you can run short exploration snippets before writing the final script (up to {k}).
+   Your FIRST reply must be ONLY a ```explore ... ``` block of Python that reads TASK_DIR and
+   prints what you need to get the solution right (exact columns/dtypes/date ranges of the inputs,
+   and a quick check of the key formula or library call). Do not write deliverables in it. Its
+   output comes back to you; then explore again if needed or reply with the final ```python ```.
 """
 
 STRUCTURE_INSTRUCTION = """4. Structure the script as one function per deliverable that computes it and writes it to

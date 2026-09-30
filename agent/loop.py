@@ -532,9 +532,15 @@ class AgentSolver:
                     break
 
                 code = extract_python_code(result.content)
+                # The first generation must explore; if the reply ALSO carries a script, that script
+                # was written before seeing any data, so the exploration wins. Later replies with
+                # a script use the script.
                 explore = (
                     _EXPLORE_BLOCK.search(strip_reasoning(result.content))
-                    if EXPLORE_STEPS and not code and phase == "generate" and not reviewing
+                    if EXPLORE_STEPS
+                    and phase == "generate"
+                    and not reviewing
+                    and (not code or explore_steps == 0)
                     else None
                 )
                 if explore and explore_steps < EXPLORE_STEPS:

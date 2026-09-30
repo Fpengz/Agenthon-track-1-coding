@@ -17,8 +17,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-SKILLS_SUMMARY = """Optional helper module `agent_skills` (importable; tested). Use it where it fits:
-- write_json(path, obj): strict JSON; NaN/inf -> null; numpy/pandas scalars, arrays, Timestamps ok
+SKILLS_SUMMARY = """Helper module `agent_skills` (importable next to your script; tested):
+- write_json(path, obj): REQUIRED for every JSON deliverable (`from agent_skills import
+  write_json`): strict JSON; NaN/inf -> null; numpy/pandas scalars, arrays, Timestamps ok
+Optional helpers:
 - read_table(path, **kw) -> DataFrame for .csv/.tsv/.parquet/.pqt/.xlsx/.json/.jsonl
 - to_datetime_index(df, column) -> df indexed by a sorted DatetimeIndex (column parsed)
 - annualized_return(returns, periods_per_year), annualized_vol(returns, periods_per_year)

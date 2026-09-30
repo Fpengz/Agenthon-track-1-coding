@@ -778,3 +778,14 @@ def test_exploration_output_reaches_the_next_prompt(tmp_path, monkeypatch):
     assert "EXPLORATION SO FAR" in client.prompts[1] and "42" in client.prompts[1]
     assert _out(tmp_path) == '{"price": 1.5}'
     assert not (tmp_path / "out" / "42").exists()
+
+
+def test_first_exploration_wins_over_a_script_in_the_same_reply(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    both = "```explore\nprint(6 * 7)\n```\n" + _writer(9)
+    client = ScriptedClient(both, WRITE_OK, "VERDICT: PASS")
+    assert _solver(tmp_path, client).run()
+    assert "42" in client.prompts[1]
+    assert _out(tmp_path) == '{"price": 1.5}'  # the pre-exploration script was not used
