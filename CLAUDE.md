@@ -124,8 +124,15 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   model may return its script unchanged to keep it; <= 2 rounds), `AGENT_PLAN=1` (one request
   extracts a requirements checklist into every prompt), `AGENT_EXPLORE=K` (tool use: up to K
   ```explore snippets run read-only with output fed back before the final script),
-  `AGENT_SKILLS=1` (advertise `agent_skills`, vetted helpers from `skills.py` copied next to
-  every script: strict JSON writer, table reader, annualisation, Sharpe, drawdown).
+  `AGENT_SKILLS=1` (advertise `agent_skills`, from `skills.py`, copied next to every script).
+  v1 (generic utilities) scored 0.203 vs 0.209: 134/141 scripts used `write_json` and nothing
+  else. v2 adds domain reference implementations -- Black-Scholes/Greeks/implied vol, bond
+  price/YTM/duration/convexity, historical and parametric VaR/ES, GBM paths, performance summary
+  -- textbook formulas tested against analytic values (never against a unit's checker), with
+  conventions as explicit arguments; only the families a task's instruction mentions are listed
+  (`skills_summary`), and the verifier is told to use them as its independent computation.
+  A/B pending. Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
+  only re-read what the input previews already show; it stays off.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
   (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
   replaces the fixed review/verifier caps (up to 4 reviews / 3 verifier rounds while

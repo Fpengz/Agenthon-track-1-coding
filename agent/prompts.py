@@ -366,6 +366,8 @@ execution rather than by reading.
    aggregation than the script uses) and compare within a sensible tolerance.
 3. Check what the specification states: required files, columns and keys, row counts, units and
    conventions (percent vs decimal, signs, dates), ranges and invariants.
+   If the prompt lists `agent_skills` reference implementations, use them as the independent
+   computation (they are tested and do not share the script's assumptions).
 4. Print one line per check, starting with `PASS:` or `FAIL:` and, for failures, the expected vs
    actual value. Exit with status 1 if any check fails, 0 otherwise.
 5. Keep it compact and put it in one ```python ... ``` block.

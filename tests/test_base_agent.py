@@ -947,3 +947,70 @@ def test_resume_helpers(tmp_path, monkeypatch):
     experiments.note_resume(run, manifest, remaining=4, jobs=2)
     assert json.loads((run / "manifest.json").read_text())["resumes"][0]["units_remaining"] == 4
     monkeypatch.delenv("AGENT_VERIFY")
+
+
+def test_domain_skills_match_analytic_values():
+    import math
+
+    import numpy as np
+
+    from agent import skills
+
+    call = float(skills.bs_price(100, 100, 1, 0.05, 0.2))
+    put = float(skills.bs_price(100, 100, 1, 0.05, 0.2, "put"))
+    assert math.isclose(call, 10.4506, abs_tol=1e-4) and math.isclose(put, 5.5735, abs_tol=1e-4)
+    assert math.isclose(call - put, 100 - 100 * math.exp(-0.05), abs_tol=1e-10)  # put-call parity
+    g = skills.bs_greeks(100, 100, 1, 0.05, 0.2)
+    h = 1e-4
+    fd_delta = (
+        skills.bs_price(100 + h, 100, 1, 0.05, 0.2) - skills.bs_price(100 - h, 100, 1, 0.05, 0.2)
+    ) / (2 * h)
+    fd_vega = (
+        skills.bs_price(100, 100, 1, 0.05, 0.2 + h) - skills.bs_price(100, 100, 1, 0.05, 0.2 - h)
+    ) / (2 * h)
+    fd_theta = -(
+        skills.bs_price(100, 100, 1 + h, 0.05, 0.2) - skills.bs_price(100, 100, 1 - h, 0.05, 0.2)
+    ) / (2 * h)
+    assert math.isclose(float(g["delta"]), float(fd_delta), abs_tol=1e-6)
+    assert math.isclose(float(g["vega"]), float(fd_vega), abs_tol=1e-4)
+    assert math.isclose(float(g["theta"]), float(fd_theta), abs_tol=1e-4)  # per year
+    pg = skills.bs_greeks(100, 100, 1, 0.05, 0.2, "put")
+    assert math.isclose(float(g["delta"] - pg["delta"]), 1.0, abs_tol=1e-12)  # no dividends
+    assert math.isclose(skills.implied_vol(put, 100, 100, 1, 0.05, "put"), 0.2, abs_tol=1e-8)
+
+    bond = skills.bond_duration_convexity(100, 0.05, 0.05, 2, freq=1)
+    assert math.isclose(bond["price"], 100.0, abs_tol=1e-9)
+    assert math.isclose(bond["macaulay_duration"], (5 / 1.05 + 2 * 105 / 1.05**2) / 100)
+    assert math.isclose(bond["modified_duration"], bond["macaulay_duration"] / 1.05)
+    bumped = skills.bond_price(100, 0.05, 0.0501, 2, 1) - 100  # dP for +1bp
+    approx = -bond["modified_duration"] * 1e-4 * 100 + 0.5 * bond["convexity"] * 1e-8 * 100
+    assert math.isclose(bumped, approx, abs_tol=1e-7)
+    assert math.isclose(skills.bond_ytm(95.0, 100, 0.05, 2, 2), 0.0774, abs_tol=1e-3)
+
+    p = skills.parametric_var_es(0.0, 1.0, 0.99)
+    assert math.isclose(p["var"], 2.3263, abs_tol=1e-4) and math.isclose(
+        p["es"], 2.6652, abs_tol=1e-4
+    )
+    hist = skills.historical_var_es([-0.05, -0.02, 0.0, 0.01, 0.03], alpha=0.8, method="lower")
+    assert hist == {"var": 0.05, "es": 0.05}
+
+    paths = skills.gbm_paths(100, 0.05, 0.2, 1.0, 12, 100_000, seed=7, antithetic=True)
+    assert paths.shape == (100_000, 13) and np.allclose(paths[:, 0], 100)
+    assert math.isclose(paths[:, -1].mean(), 100 * math.exp(0.05), rel_tol=2e-3)
+    assert np.array_equal(
+        paths, skills.gbm_paths(100, 0.05, 0.2, 1.0, 12, 100_000, seed=7, antithetic=True)
+    )
+
+    perf = skills.performance_summary([0.10, -0.20, 0.05], 12)
+    assert math.isclose(perf["max_drawdown"], 0.88 / 1.1 - 1.0)
+    assert math.isclose(perf["total_return"], 1.1 * 0.8 * 1.05 - 1)
+
+
+def test_skills_summary_lists_only_relevant_families():
+    from agent.skills import skills_summary
+
+    options = skills_summary("Compute Black-Scholes Greeks for European options.")
+    assert "bs_price" in options and "bond_price" not in options and "write_json" in options
+    bonds = skills_summary("Compute modified duration and convexity of each coupon bond.")
+    assert "bond_duration_convexity" in bonds and "bs_price" not in bonds
+    assert "gbm_paths" not in skills_summary("Clean the filings table.")

@@ -50,7 +50,7 @@ from agent.review import (
     restore_outputs,
     snapshot_outputs,
 )
-from agent.skills import SKILLS_SUMMARY
+from agent.skills import skills_summary
 from agent.spec import DeliverableSpec, parse_spec, spec_problems
 
 logger = logging.getLogger(__name__)
@@ -457,7 +457,7 @@ class AgentSolver:
                 path_map=parts.path_map,
                 structured=STRUCTURED,
                 task_facts=parts.task_facts,
-                skills_summary=SKILLS_SUMMARY if SKILLS else "",
+                skills_summary=skills_summary(parts.instruction_text) if SKILLS else "",
                 explore_steps=EXPLORE_STEPS,
                 **{k: v for k, v in parts.optional.items() if k not in dropped},
             )
