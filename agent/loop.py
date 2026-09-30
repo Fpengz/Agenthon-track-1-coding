@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -24,17 +25,22 @@ from agent.executor import (
     extract_python_code,
     join_continuation,
     run_code,
+    strip_reasoning,
 )
 from agent.inputs import build_input_previews
 from agent.knowledge import domain_notes, read_card
 from agent.prompts import (
     SYSTEM_PROMPT,
+    VERIFY_REPAIR_HEADLINE,
     build_continuation_prompt,
+    build_exploration_section,
     build_initial_prompt,
     build_judge_prompt,
     build_no_code_prompt,
+    build_plan_prompt,
     build_repair_prompt,
     build_review_prompt,
+    build_verify_prompt,
 )
 from agent.review import (
     output_diagnostics,
@@ -43,6 +49,7 @@ from agent.review import (
     restore_outputs,
     snapshot_outputs,
 )
+from agent.skills import SKILLS_SUMMARY
 from agent.spec import DeliverableSpec, parse_spec, spec_problems
 
 logger = logging.getLogger(__name__)
@@ -79,6 +86,23 @@ SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", 
 MAX_SPEC_REPAIRS = 2
 # Few-shot reference examples from agent/examples/library.jsonl (rule 8: OTHER units only).
 EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true", "on"}
+# Model-written verification tests (executed on a COPY of the outputs) after a clean run, and a
+# requirements checklist extracted up front. Both spend otherwise-unused requests on evidence
+# about correctness: 115 of 136 failing units ended "accepted but wrong".
+VERIFY = os.environ.get("AGENT_VERIFY", "0").strip().lower() in {"1", "true", "on"}
+MAX_VERIFY = 2
+VERIFY_TIMEOUT_SEC = 120
+PLAN = os.environ.get("AGENT_PLAN", "0").strip().lower() in {"1", "true", "on"}
+MAX_CHECKLIST_CHARS = 3000
+# Tool use: up to AGENT_EXPLORE exploration snippets (run read-only, output fed back) before the
+# final script. Skills: the vetted agent_skills helpers are always importable; AGENT_SKILLS=1
+# advertises them in the prompt.
+EXPLORE_STEPS = max(0, int(os.environ.get("AGENT_EXPLORE", "0")))
+EXPLORE_TIMEOUT_SEC = 60
+EXPLORE_OUTPUT_CHARS = 2500
+EXPLORE_LOG_CHARS = 7000
+SKILLS = os.environ.get("AGENT_SKILLS", "0").strip().lower() in {"1", "true", "on"}
+_EXPLORE_BLOCK = re.compile(r"^```[ \t]*explore[^\n]*\n(.*?)^```[ \t]*$", re.S | re.M)
 # One function per deliverable, failures isolated and reported together (fewer no-output units).
 STRUCTURED = os.environ.get("AGENT_STRUCTURED", "0").strip().lower() in {
     "1",
@@ -104,7 +128,8 @@ _DROP_ORDER: list[frozenset[str]] = [
     frozenset(),
     frozenset({"reference_example"}),
     frozenset({"reference_example", "domain_notes"}),
-    frozenset({"reference_example", "domain_notes", "input_previews"}),
+    frozenset({"reference_example", "domain_notes", "requirements_checklist"}),
+    frozenset({"reference_example", "domain_notes", "requirements_checklist", "input_previews"}),
 ]
 
 
@@ -385,6 +410,7 @@ class AgentSolver:
             path_map=path_map,
             task_facts=card_facts(self.task_dir),
             optional={
+                "requirements_checklist": "",
                 "input_previews": build_input_previews(self.task_dir, input_files),
                 "domain_notes": domain_notes(self.task_dir, instruction_text),
                 "reference_example": format_example(
@@ -392,6 +418,8 @@ class AgentSolver:
                 ),
             },
         )
+        if PLAN:
+            self._prompt_parts.optional["requirements_checklist"] = self._requirements_checklist()
         prompt_variants = self._prompt_variants(self.out_dir)
         initial_prompt = prompt_variants[0]
         logger.info(
@@ -421,6 +449,8 @@ class AgentSolver:
                 path_map=parts.path_map,
                 structured=STRUCTURED,
                 task_facts=parts.task_facts,
+                skills_summary=SKILLS_SUMMARY if SKILLS else "",
+                explore_steps=EXPLORE_STEPS,
                 **{k: v for k, v in parts.optional.items() if k not in dropped},
             )
             for dropped in _DROP_ORDER
@@ -455,6 +485,10 @@ class AgentSolver:
         last_feedback = ""
         edit_base = ""  # the script shown in the pending repair/review prompt (edits apply to it)
         spec_repairs = 0
+        verifies = 0
+        explore_steps = 0
+        exploration_log: list[tuple[str, str]] = []
+        verify_code = ""  # the script a verifier-driven repair was asked about
         loop_started = time.monotonic()
 
         # Iterative execution & self-repair loop
@@ -478,14 +512,46 @@ class AgentSolver:
                         break
                     user_prompt, initial_prompt, max_tokens = fitted
                     messages[1]["content"] = user_prompt
+                    phase = (
+                        "review"
+                        if reviewing
+                        else "continue"
+                        if partial_code
+                        else "repair"
+                        if edit_base
+                        else "generate"
+                    )
                     result = self.client.chat(
-                        messages=messages, temperature=temperature, max_tokens=max_tokens
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        phase=phase,
                     )
                 except Exception:
                     logger.exception("Failed to query the model on attempt %d", attempt)
                     break
 
                 code = extract_python_code(result.content)
+                explore = (
+                    _EXPLORE_BLOCK.search(strip_reasoning(result.content))
+                    if EXPLORE_STEPS and not code and phase == "generate" and not reviewing
+                    else None
+                )
+                if explore and explore_steps < EXPLORE_STEPS:
+                    # Tool use: run the snippet read-only and hand its output back.
+                    explore_steps += 1
+                    snippet = explore.group(1).strip()
+                    exploration_log.append((snippet, self._explore(snippet, work_dir)))
+                    while (
+                        len(exploration_log) > 1
+                        and sum(len(a) + len(b) for a, b in exploration_log) > EXPLORE_LOG_CHARS
+                    ):
+                        exploration_log.pop(0)
+                    logger.info("Exploration step %d/%d", explore_steps, EXPLORE_STEPS)
+                    user_prompt = initial_prompt + build_exploration_section(
+                        exploration_log, EXPLORE_STEPS - explore_steps
+                    )
+                    continue
                 if edit_base:
                     edited, unmatched = apply_edits(edit_base, result.content)
                     if edited is not None:
@@ -572,6 +638,11 @@ class AgentSolver:
                     temperature = 0.6
                     continue
                 temperature = 0.0
+                if verify_code and code == verify_code:
+                    # The model judged the verifier wrong and kept its script: the outputs of
+                    # that clean run are still in place (the verifier ran on a copy).
+                    return self._accept(attempt, "kept after verification", reviewed_code)
+                verify_code = ""
                 if code == last_failed_code:
                     # The model copied the failing script back verbatim (copying stays near-
                     # deterministic even when sampling): it cannot see the bug. Running it again
@@ -681,6 +752,30 @@ class AgentSolver:
                             "specification: required columns or keys are missing.",
                         )
                         continue
+                    if (
+                        VERIFY
+                        and verifies < MAX_VERIFY
+                        and self._requests_left() >= 3
+                        and self._time_left() > 2 * MIN_ATTEMPT_SEC
+                    ):
+                        verifies += 1
+                        report = self._run_verifier(initial_prompt, code, work_dir, accepted_dir)
+                        if report:
+                            logger.warning(
+                                "Verification failed (round %d): %s", verifies, report[:200]
+                            )
+                            continuations = 0
+                            edit_base = code
+                            verify_code = code
+                            user_prompt = build_repair_prompt(
+                                edit_mode=_edit_mode(code),
+                                task_prompt=initial_prompt,
+                                previous_code=code,
+                                error_message=report,
+                                out_dir=str(self.out_dir),
+                                headline=VERIFY_REPAIR_HEADLINE,
+                            )
+                            continue
                     elapsed = time.monotonic() - loop_started
                     requests_left = getattr(self.client, "max_requests", 0) - getattr(
                         self.client, "request_count", 0
@@ -803,6 +898,101 @@ class AgentSolver:
             except OSError:
                 logger.debug("Could not save the accepted script", exc_info=True)
 
+    # ------------------------------------------------------------------ extra evidence
+
+    def _explore(self, snippet: str, work_dir: pathlib.Path) -> str:
+        """Run an exploration snippet; its output (bounded) for the next prompt.
+
+        OUTPUT_DIR points at a scratch directory, so exploration can never create or change
+        deliverables.
+        """
+        run = run_code(
+            snippet,
+            work_dir / "explore",
+            work_dir / "explore-out",
+            task_dir=self.task_dir,
+            timeout_sec=int(min(EXPLORE_TIMEOUT_SEC, max(20.0, self._time_left() - 60))),
+        )
+        text = run.stdout.strip()
+        if run.returncode != 0:
+            text = f"{text}\n[exit {run.returncode}]\n{run.feedback}".strip()
+        return text[-EXPLORE_OUTPUT_CHARS:] or "(no output)"
+
+    def _requirements_checklist(self) -> str:
+        """One request: a numbered requirements checklist extracted from the specification."""
+        prompt = build_plan_prompt(self._prompt_variants(self.out_dir)[0])
+        try:
+            result = self.client.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                phase="plan",
+            )
+        except Exception:
+            logger.exception("Requirements checklist request failed; continuing without it")
+            return ""
+        text = result.content.split("</think>")[-1].replace("```", "").strip()
+        logger.info("Requirements checklist: %d lines", len(text.splitlines()))
+        return text[:MAX_CHECKLIST_CHARS]
+
+    def _run_verifier(
+        self, task_prompt: str, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path
+    ) -> str:
+        """Model-written verification of a clean run; the failure report, or "" if it passed.
+
+        The verifier runs against a COPY of the accepted outputs, so it cannot alter the
+        deliverables. A verifier that crashes without reporting any FAIL is ignored: only
+        explicit, executed failures reach the repair loop.
+        """
+        prompt = build_verify_prompt(
+            task_prompt,
+            code,
+            build_input_previews(self.out_dir, output_files(self.out_dir), label="OUTPUT_DIR"),
+        )
+        variants = self._prompt_variants(self.out_dir)
+        fitted = fit_to_context(prompt, task_prompt, variants)
+        if fitted is None:
+            return ""
+        try:
+            result = self.client.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": fitted[0]},
+                ],
+                temperature=0.0,
+                max_tokens=fitted[2],
+                phase="verify",
+            )
+        except Exception:
+            logger.exception("Verifier request failed; skipping verification")
+            return ""
+        verifier = extract_python_code(result.content)
+        if not verifier:
+            return ""
+        copy_dir = work_dir / "verify-outputs"
+        if copy_dir.exists():
+            shutil.rmtree(copy_dir)
+        shutil.copytree(accepted_dir, copy_dir)
+        run = run_code(
+            verifier,
+            work_dir / "verify",
+            copy_dir,
+            task_dir=self.task_dir,
+            timeout_sec=int(min(VERIFY_TIMEOUT_SEC, max(30.0, self._time_left() - 30))),
+        )
+        failures = [ln for ln in run.stdout.splitlines() if ln.strip().startswith("FAIL")]
+        logger.info(
+            "Verifier: %d PASS, %d FAIL (returncode=%d)",
+            sum(ln.strip().startswith("PASS") for ln in run.stdout.splitlines()),
+            len(failures),
+            run.returncode,
+        )
+        if not failures:
+            return ""
+        return "Verifier failures:\n" + "\n".join(failures[:20])
+
     # ------------------------------------------------------------------ best-of-N consensus
 
     def _requests_left(self) -> int:
@@ -832,6 +1022,7 @@ class AgentSolver:
                 ],
                 temperature=0.0,
                 max_tokens=fitted[2],
+                phase="judge",
             )
         except Exception:
             logger.exception("Consensus judge request failed; keeping candidate %s", a[0])

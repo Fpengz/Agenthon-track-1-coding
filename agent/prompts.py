@@ -59,6 +59,12 @@ CRITICAL OPERATING RULES:
 
 _MAX_PATH_MAP_LINES = 40
 
+EXPLORE_INSTRUCTION = """5. Tool: before the final script you may run up to {k} short exploration snippets (inspect the
+   data, test a formula, check a library call). To run one, reply with ONLY a ```explore ... ```
+   block of Python (read TASK_DIR; print what you need; do not write deliverables); its output
+   comes back to you. When ready, reply with the final ```python ... ``` script.
+"""
+
 STRUCTURE_INSTRUCTION = """4. Structure the script as one function per deliverable that computes it and writes it to
    OUTPUT_DIR immediately. Load inputs once and pass them in. In main(), call each deliverable
    function inside try/except, print the full traceback of any failure, continue with the rest,
@@ -89,6 +95,9 @@ def build_initial_prompt(
     reference_example: str = "",
     structured: bool = False,
     task_facts: str = "",
+    requirements_checklist: str = "",
+    skills_summary: str = "",
+    explore_steps: int = 0,
 ) -> str:
     """Format the initial prompt for the coding agent (the task prompt reused by every turn)."""
     notes_str = (
@@ -124,12 +133,12 @@ def build_initial_prompt(
 
 ### INPUT DATA PREVIEWS:
 {input_previews or "(none)"}
-{notes_str}{reference_example}
+{notes_str}{f"{chr(10)}### REQUIREMENTS CHECKLIST (extracted from the specification; verify each item):{chr(10)}{requirements_checklist}{chr(10)}" if requirements_checklist else ""}{reference_example}
 ### INSTRUCTIONS:
 1. Write a complete, standalone Python script that reads inputs from TASK_DIR and writes the required deliverables to OUTPUT_DIR.
 2. Ensure all column names, file formats, and data structures match the specification exactly.
 3. Keep reasoning brief, then enclose your complete script inside one ```python ... ``` code block.
-{STRUCTURE_INSTRUCTION if structured else ""}"""
+{STRUCTURE_INSTRUCTION if structured else ""}{EXPLORE_INSTRUCTION.format(k=explore_steps) if explore_steps else ""}{f"{chr(10)}{skills_summary}{chr(10)}" if skills_summary else ""}"""
 
 
 def build_repair_prompt(
@@ -330,3 +339,66 @@ Decide which candidate follows the TASK SPECIFICATION (definitions, conventions,
 cases) more faithfully for the values that disagree. Think briefly, then end your reply with a
 single line: `CHOICE: A` or `CHOICE: B`.
 """
+
+
+def build_verify_prompt(task_prompt: str, code: str, output_previews: str) -> str:
+    """Ask for an executable, independent verification script for a clean run's outputs."""
+    return f"""{task_prompt}
+
+---
+The script below ran cleanly and wrote the deliverables. Write a SEPARATE verification script
+that checks those outputs against the TASK SPECIFICATION, so that mistakes are caught by
+execution rather than by reading.
+
+### SCRIPT THAT PRODUCED THE OUTPUTS:
+```python
+{code}
+```
+
+### OUTPUT PREVIEWS:
+{output_previews or "(none)"}
+
+### VERIFIER REQUIREMENTS:
+1. Read inputs from TASK_DIR and the deliverables from OUTPUT_DIR (environment variables). Do not
+   write or modify any file.
+2. Where practical, recompute 2-4 key values INDEPENDENTLY (a different formula, method or
+   aggregation than the script uses) and compare within a sensible tolerance.
+3. Check what the specification states: required files, columns and keys, row counts, units and
+   conventions (percent vs decimal, signs, dates), ranges and invariants.
+4. Print one line per check, starting with `PASS:` or `FAIL:` and, for failures, the expected vs
+   actual value. Exit with status 1 if any check fails, 0 otherwise.
+5. Keep it compact and put it in one ```python ... ``` block.
+"""
+
+
+VERIFY_REPAIR_HEADLINE = (
+    "Your script ran cleanly, but an independent verification script reported the failures "
+    "below. The verifier may itself be wrong: if your script follows the specification, return "
+    "it UNCHANGED (the same complete script); otherwise fix it."
+)
+
+
+def build_plan_prompt(task_prompt: str) -> str:
+    """Ask for a requirements checklist extracted from the specification (no code)."""
+    return f"""{task_prompt}
+
+---
+Do NOT write code yet. Extract a numbered checklist of every requirement in the TASK
+SPECIFICATION that a checker could test: each deliverable file with its exact columns or keys
+and their order, formulas and their parameters, units and conventions (percent vs decimal,
+annualisation, sign, day count, date alignment), filters and edge cases, sorting and row counts.
+Quote exact names. One short line per item, at most 30 items, no preamble.
+"""
+
+
+def build_exploration_section(log: list[tuple[str, str]], steps_left: int) -> str:
+    """Previous exploration snippets and their outputs, appended to the generation prompt."""
+    parts = ["\n### EXPLORATION SO FAR:"]
+    for i, (snippet, output) in enumerate(log, 1):
+        parts.append(f"#### Snippet {i}\n```python\n{snippet}\n```\nOutput:\n```\n{output}\n```")
+    parts.append(
+        f"\nYou may explore {steps_left} more time(s), or reply with the final ```python``` script."
+        if steps_left
+        else "\nNo exploration left: reply with the final complete ```python ... ``` script now."
+    )
+    return "\n".join(parts)

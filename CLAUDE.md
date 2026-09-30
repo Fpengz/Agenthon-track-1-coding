@@ -110,6 +110,15 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   function per deliverable; 0.163), `AGENT_CANDIDATES` (consensus; same gain as low reasoning at
   12.7 requests / 521 s per unit, over the roster budget), `AGENT_DOMAIN_NOTES` (0.140 vs 0.157).
   Results per run are in `experiments/registry.jsonl`.
+- Methods that spend the unused request budget (all default off; A/B pending):
+  `HOUSE_REASONING=hybrid` (low effort for generation, off for review/repair/continuation; the
+  not-honoured detector only judges generation replies), `AGENT_VERIFY=1` (model-written
+  verifier executed on a COPY of the outputs; explicit `FAIL:` lines drive a repair, and the
+  model may return its script unchanged to keep it; <= 2 rounds), `AGENT_PLAN=1` (one request
+  extracts a requirements checklist into every prompt), `AGENT_EXPLORE=K` (tool use: up to K
+  ```explore snippets run read-only with output fed back before the final script),
+  `AGENT_SKILLS=1` (advertise `agent_skills`, vetted helpers from `skills.py` copied next to
+  every script: strict JSON writer, table reader, annualisation, Sharpe, drawdown).
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt

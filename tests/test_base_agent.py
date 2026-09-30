@@ -153,6 +153,7 @@ class ScriptedClient:
 
     def chat(self, messages, **kwargs):
         self.request_count += 1
+        self.prompts = getattr(self, "prompts", []) + [messages[-1]["content"]]
         return ChatResult(content=self.responses.pop(0), finish_reason="stop")
 
 
@@ -679,3 +680,101 @@ def test_parallel_consensus_candidates_cannot_clobber_each_other(tmp_path, monke
     )  # fmt: skip
     assert solver.run()
     assert _out(tmp_path) == '{"price": 1.5}'  # B failed; its writes stayed in its staging dir
+
+
+def test_skills_helpers(tmp_path):
+    import json
+    import math
+
+    import numpy as np
+    import pandas as pd
+
+    from agent import skills
+
+    skills.write_json(
+        tmp_path / "r.json",
+        {
+            "a": np.float64(1.5),
+            "b": float("nan"),
+            "c": np.array([1, 2]),
+            "d": pd.Timestamp("2024-01-31"),
+            "e": np.inf,
+        },
+    )
+    assert json.loads((tmp_path / "r.json").read_text()) == {
+        "a": 1.5, "b": None, "c": [1, 2], "d": "2024-01-31T00:00:00", "e": None,
+    }  # fmt: skip
+    returns = [0.10, -0.20, 0.05]
+    assert math.isclose(skills.max_drawdown(returns), 0.88 / 1.1 - 1.0)  # peak 1.1 -> trough 0.88
+    assert math.isclose(skills.max_drawdown([100, 120, 90, 130], is_returns=False), -0.25)
+    assert math.isclose(skills.annualized_return([0.01] * 12, 12), 1.01**12 - 1)
+    r = pd.Series([0.01, 0.02, -0.01, 0.03])
+    assert math.isclose(skills.annualized_vol(r, 12), r.std(ddof=1) * math.sqrt(12))
+    assert math.isclose(skills.sharpe_ratio(r, 12), r.mean() / r.std(ddof=1) * math.sqrt(12))
+    assert skills.cumulative_returns([0.1, 0.1]).round(10).tolist() == [0.1, 0.21]
+    (tmp_path / "t.tsv").write_text("date\tv\n2024-02-01\t2\n2024-01-01\t1\n")
+    indexed = skills.to_datetime_index(skills.read_table(tmp_path / "t.tsv"), "date")
+    assert indexed["v"].tolist() == [1, 2]
+
+
+def test_hybrid_reasoning_per_phase(monkeypatch):
+    from agent.client import HouseModelClient
+
+    monkeypatch.setenv("HOUSE_REASONING", "hybrid")
+    client = HouseModelClient(base_url="http://127.0.0.1:9", model_name="x")
+    assert client._mode_for("generate") == "low"
+    assert client._mode_for("review") == "off" and client._mode_for("repair") == "off"
+    client._check_low_effort("thinking " * 1000 + "</think>```python\nx\n```", "stop")
+    assert client._mode_for("generate") == "off"  # not honoured -> generation falls back
+    assert client.reasoning_mode == "hybrid"
+
+
+FAILING_VERIFIER = "```python\nprint('FAIL: price expected 2.5 got 1.5')\nraise SystemExit(1)\n```"
+PASSING_VERIFIER = "```python\nprint('PASS: price')\n```"
+
+
+def test_verifier_failure_drives_a_repair(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "VERIFY", True)
+    fixed = _writer(2.5)
+    client = ScriptedClient(WRITE_OK, FAILING_VERIFIER, fixed, PASSING_VERIFIER, "VERDICT: PASS")
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 5  # script, verifier, repair, verifier, review
+    assert "FAIL: price expected 2.5 got 1.5" in client.prompts[2]
+    assert _out(tmp_path) == '{"price": 2.5}'
+
+
+def test_model_may_keep_its_script_against_a_wrong_verifier(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "VERIFY", True)
+    client = ScriptedClient(WRITE_OK, FAILING_VERIFIER, WRITE_OK)  # returns the same script
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 3
+    assert _out(tmp_path) == '{"price": 1.5}'
+
+
+def test_requirements_checklist_is_requested_once_and_used(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "PLAN", True)
+    client = ScriptedClient("1. r.json must contain `price`", WRITE_OK, "VERDICT: PASS")
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 3
+    assert (
+        "REQUIREMENTS CHECKLIST" in client.prompts[1]
+        and "must contain `price`" in client.prompts[1]
+    )
+
+
+def test_exploration_output_reaches_the_next_prompt(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    client = ScriptedClient("```explore\nprint(6 * 7)\n```", WRITE_OK, "VERDICT: PASS")
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 3
+    assert "EXPLORATION SO FAR" in client.prompts[1] and "42" in client.prompts[1]
+    assert _out(tmp_path) == '{"price": 1.5}'
+    assert not (tmp_path / "out" / "42").exists()

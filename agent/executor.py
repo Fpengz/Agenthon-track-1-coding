@@ -17,6 +17,8 @@ import tokenize
 
 from agent.error_context import HOOK_SOURCE
 
+SKILLS_SOURCE = pathlib.Path(__file__).resolve().parent / "skills.py"
+
 logger = logging.getLogger(__name__)
 _LOG_PREVIEW_LIMIT = 1200
 _FEEDBACK_STDOUT_LIMIT = 1500
@@ -310,6 +312,8 @@ def run_code(
     script_path.write_text(code, encoding="utf-8")
     # Structured error context on failure (agent/error_context.py); imported at interpreter start.
     (attempt_dir / "sitecustomize.py").write_text(HOOK_SOURCE, encoding="utf-8")
+    # Vetted helpers the script may import as `agent_skills` (agent/skills.py).
+    shutil.copy2(SKILLS_SOURCE, attempt_dir / "agent_skills.py")
     logger.info(
         "Saved generated Python solution to %s (%d characters)",
         script_path,

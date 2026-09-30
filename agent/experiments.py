@@ -39,6 +39,10 @@ SETTING_VARS = (
     "AGENT_SPEC_CHECKS",
     "AGENT_EXAMPLES",
     "AGENT_STRUCTURED",
+    "AGENT_VERIFY",
+    "AGENT_PLAN",
+    "AGENT_EXPLORE",
+    "AGENT_SKILLS",
 )
 _SLUG = re.compile(r"[^a-z0-9]+")
 

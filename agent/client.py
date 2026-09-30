@@ -43,7 +43,11 @@ class ChatResult:
 #        organizers forward it but mark it untested, hence the fallback below.
 #   off: enable_thinking=false -- documented by the organizers as the thinking control
 #   on:  server default (full reasoning)
+# "hybrid" resolves per request: low effort for generation, off for review/repair/continuation
+# (the confirmation runs, 20/86 twice, effectively ran this way).
+HYBRID = "hybrid"
 REASONING_MODES: dict[str, dict[str, Any] | None] = {
+    HYBRID: None,
     "off": {"enable_thinking": False},
     "low": {"low_effort": True},
     "on": None,
@@ -98,6 +102,7 @@ class HouseModelClient:
             logger.warning("Unknown HOUSE_REASONING=%r; using %r", mode, DEFAULT_REASONING_MODE)
             mode = DEFAULT_REASONING_MODE
         self.reasoning_mode = mode
+        self.hybrid_generate_mode = "low"
 
         logger.info(
             "Initialized House Model client (model=%s, request_limit=%d, reasoning=%s)",
@@ -136,12 +141,17 @@ class HouseModelClient:
         messages: list[ChatCompletionMessageParam],
         max_tokens: int = MAX_OUTPUT_TOKENS,
         temperature: float = 0.0,
+        phase: str = "generate",
         **kwargs: Any,
     ) -> ChatResult:
-        """Send a completion request, retrying transient failures within the request budget."""
+        """Send a completion request, retrying transient failures within the request budget.
+
+        ``phase`` (generate / repair / review / continue / judge / verify / plan) selects the
+        reasoning effort in hybrid mode.
+        """
         for retry in range(TRANSIENT_RETRIES + 1):
             try:
-                return self._chat_once(messages, max_tokens, temperature, **kwargs)
+                return self._chat_once(messages, max_tokens, temperature, phase, **kwargs)
             except _TRANSIENT_ERRORS as exc:
                 if retry == TRANSIENT_RETRIES or self.request_count >= self.max_requests:
                     raise
@@ -157,11 +167,13 @@ class HouseModelClient:
         messages: list[ChatCompletionMessageParam],
         max_tokens: int,
         temperature: float,
+        phase: str,
         **kwargs: Any,
     ) -> ChatResult:
         """One completion request, respecting the 25-request ceiling."""
         kwargs = dict(kwargs)
-        template_kwargs = REASONING_MODES[self.reasoning_mode]
+        mode = self._mode_for(phase)
+        template_kwargs = REASONING_MODES[mode]
         if template_kwargs is not None and "extra_body" not in kwargs:
             kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
         with self._lock:
@@ -235,13 +247,21 @@ class HouseModelClient:
             choice.finish_reason,
         )
         self._save_transcript(number, messages, content, choice.finish_reason)
-        self._check_low_effort(content, choice.finish_reason)
+        if mode == "low" and phase == "generate":
+            self._check_low_effort(content, choice.finish_reason)
         return ChatResult(content=content, finish_reason=choice.finish_reason)
 
+    def _mode_for(self, phase: str) -> str:
+        if self.reasoning_mode != HYBRID:
+            return self.reasoning_mode
+        return self.hybrid_generate_mode if phase == "generate" else "off"
+
     def _check_low_effort(self, content: str, finish_reason: str | None) -> None:
-        """Fall back from "low" to "off" when a reply shows low effort was not applied."""
-        if self.reasoning_mode != "low":
-            return
+        """Fall back from "low" to "off" when a GENERATION reply shows low effort was ignored.
+
+        Only generation replies are judged: reviews legitimately reason at length (90 of 137
+        triggers in the confirmation runs were review replies, not ignored low effort).
+        """
         reasoning = content.split("</think>", 1)[0] if "</think>" in content else ""
         cut_off_without_code = finish_reason == "length" and "```" not in content
         if len(reasoning) > LOW_EFFORT_MAX_REASONING_CHARS or cut_off_without_code:
@@ -251,7 +271,10 @@ class HouseModelClient:
                 len(reasoning),
                 finish_reason,
             )
-            self.reasoning_mode = "off"
+            if self.reasoning_mode == HYBRID:
+                self.hybrid_generate_mode = "off"
+            else:
+                self.reasoning_mode = "off"
 
     def _save_transcript(
         self,
