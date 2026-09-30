@@ -15,7 +15,7 @@ import typer
 from dotenv import load_dotenv
 
 from agent import experiments
-from agent.batch import run_units
+from agent.batch import load_results, run_units
 from agent.examples import LIBRARY, harvest, load_library
 from agent.loop import AgentSolver
 
@@ -130,6 +130,14 @@ def solve_units(
         bool,
         typer.Option("--keep-inputs", help="Keep each unit's staged input copy (debugging)."),
     ] = False,
+    resume: Annotated[
+        str | None,
+        typer.Option(
+            "--resume",
+            help="Continue an interrupted run (run id, path or unique name): its recorded "
+            "settings and image are reused and only unfinished units run.",
+        ),
+    ] = None,
     register: Annotated[
         bool,
         typer.Option(
@@ -164,6 +172,23 @@ def solve_units(
     ] = None,
 ) -> None:
     """Run the agent over every unit in a folder and summarise the results."""
+    prior_results = None
+    resumed: dict = {}
+    if resume:
+        try:
+            run_dir = experiments.find_run_dir(resume)
+        except KeyError as exc:
+            logger.error("%s", exc)
+            raise typer.Exit(code=2) from exc
+        resumed = experiments.load_manifest(run_dir)
+        experiments.apply_settings(resumed)  # same switches and budget as the original run
+        name, note, baseline = resumed["name"], resumed.get("note", ""), resumed.get("baseline")
+        patterns = resumed["units"]
+        agent_image = experiments.resume_image(resumed)
+        timeout = resumed.get("timeout_override")
+        prior_results = load_results(run_dir)
+        if not prior_results:
+            logger.warning("No finished units recorded in %s: running all of them", run_dir)
     run_path = (run_dir or experiments.RUNS_DIR / experiments.make_run_id(name)).resolve()
     run_path.mkdir(parents=True, exist_ok=True)
     # The run keeps its own log next to its artifacts (no stray log files to manage).
@@ -173,6 +198,12 @@ def solve_units(
     manifest: dict = {}
 
     def on_start(units: list[Path], check_image: str | None) -> None:
+        if resumed:
+            remaining = len(units)  # the runner passes only the unfinished units
+            experiments.note_resume(run_path, resumed, remaining, jobs)
+            manifest.update(resumed)
+            logger.info("Resuming run %s: %d unit(s) left", run_path.name, remaining)
+            return
         manifest.update(
             experiments.write_manifest(
                 run_path,
@@ -201,12 +232,15 @@ def solve_units(
             agent_image=agent_image,
             keep_inputs=keep_inputs,
             on_start=on_start,
+            prior_results=prior_results,
         )
     except ValueError as exc:
         logger.error("%s", exc)
         raise typer.Exit(code=2) from exc
     summary_path = run_path / "summary.json"
-    if register and manifest and summary_path.is_file():
+    if resumed and experiments.is_registered(run_path.name):
+        logger.info("%s is already in the registry; not recording it again", run_path.name)
+    elif register and manifest and summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         experiments.append_registry(experiments.registry_entry(manifest, summary))
         logger.info("Recorded %s in %s", run_path.name, experiments.REGISTRY)

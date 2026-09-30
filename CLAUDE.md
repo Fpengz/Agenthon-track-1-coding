@@ -235,6 +235,7 @@ uv run agent/main.py solve --task-dir units/t1-EXAMPLE-bs-greeks-pde --out ./tmp
 uv run python -m agent.main solve-units -j 8 --agent-image agenthon-agent:latest \
   --name notes-off --note "what this run tests" --baseline 20260929-0816-review-on
 uv run python -m agent.main solve-units 't1-EXAMPLE-*' --no-check --timeout 600 --no-register
+uv run python -m agent.main solve-units --resume <run_id|name> -j 2   # finish an interrupted run
 uv run python -m agent.main runs list                        # recorded runs
 uv run python -m agent.main runs compare BASE OTHER [...]    # shared-unit pass@1 + per-unit flips
 uv run python -m agent.main runs prune RUN_ID                # drop raw artifacts, keep the record

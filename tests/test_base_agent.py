@@ -867,3 +867,83 @@ def test_adaptive_budget_stops_early_on_a_slow_route(tmp_path, monkeypatch):
     assert _solver(tmp_path, client).run()
     assert client.request_count == 1
     assert _out(tmp_path) == '{"price": 1}'
+
+
+def test_resume_keeps_finished_units_and_runs_only_the_rest(tmp_path, monkeypatch):
+    import dataclasses
+    import json
+
+    from agent import batch
+
+    units = tmp_path / "units"
+    for name in ("u1", "u2", "u3"):
+        (units / name).mkdir(parents=True)
+        (units / name / "instruction.md").write_text("x")
+    run = tmp_path / "run"
+    (run / "u2" / "output").mkdir(parents=True)
+    (run / "u2" / "output" / "stale.json").write_text("{}")  # left by the interrupted attempt
+    done = batch.UnitResult(unit="u1", status="passed", reward=1.0, gates={"g1_schema": True})
+    (run / "results.jsonl").write_text(
+        json.dumps(dataclasses.asdict(done)) + "\n" + '{"unit": "u2", "status": "fai'  # cut off
+    )
+    prior = batch.load_results(run)
+    assert [r.unit for r in prior] == ["u1"]  # the truncated line is dropped
+
+    ran = []
+
+    def fake_run_unit(unit_dir, run_dir, *args):
+        ran.append(unit_dir.name)
+        return batch.UnitResult(unit=unit_dir.name, status="failed", reward=0.0, gates={})
+
+    monkeypatch.setattr(batch, "run_unit", fake_run_unit)
+    results = batch.run_units(
+        units, run, [], jobs=2, check=False, checker_image="x", timeout_override=None,
+        limit=None, prior_results=prior,
+    )  # fmt: skip
+    assert sorted(ran) == ["u2", "u3"]
+    assert [(r.unit, r.status) for r in results] == [
+        ("u1", "passed"),
+        ("u2", "failed"),
+        ("u3", "failed"),
+    ]
+    summary = json.loads((run / "summary.json").read_text())
+    assert summary["units"] == 3 and summary["units_planned"] == 3
+    assert len((run / "results.jsonl").read_text().splitlines()) == 3
+
+
+def test_unit_folder_is_cleaned_before_a_rerun(tmp_path, monkeypatch):
+    from agent import batch
+
+    unit = tmp_path / "units" / "u1"
+    unit.mkdir(parents=True)
+    (unit / "instruction.md").write_text("x")
+    stale = tmp_path / "run" / "u1" / "output" / "stale.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}")
+    monkeypatch.setattr(batch, "agent_command", lambda *a: (["true"], {}))
+    batch._execute_unit(unit, tmp_path / "run", None, 30, None)
+    assert not stale.exists()
+
+
+def test_resume_helpers(tmp_path, monkeypatch):
+    import json
+
+    from agent import experiments
+
+    run = tmp_path / "20260101-0000-demo-r1"
+    run.mkdir()
+    manifest = {
+        "run_id": run.name,
+        "name": "demo-r1",
+        "settings": {"AGENT_VERIFY": "1", "AGENT_PLAN": None},
+    }
+    (run / "manifest.json").write_text(json.dumps(manifest))
+    assert experiments.find_run_dir("demo-r1", tmp_path) == run.resolve()
+    monkeypatch.setenv("AGENT_PLAN", "1")
+    experiments.apply_settings(manifest)
+    import os
+
+    assert os.environ["AGENT_VERIFY"] == "1" and "AGENT_PLAN" not in os.environ
+    experiments.note_resume(run, manifest, remaining=4, jobs=2)
+    assert json.loads((run / "manifest.json").read_text())["resumes"][0]["units_remaining"] == 4
+    monkeypatch.delenv("AGENT_VERIFY")

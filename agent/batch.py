@@ -299,6 +299,10 @@ def _execute_unit(
     keep_inputs: bool = False,
 ) -> UnitResult:
     unit_run = run_dir / unit_dir.name
+    if unit_run.exists():
+        # A fresh directory per attempt: a unit interrupted mid-run (then resumed) must not
+        # leave half-written outputs for the checker.
+        shutil.rmtree(unit_run)
     task_dir = stage_unit(unit_dir, unit_run / "input")
     out_dir = unit_run / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -367,10 +371,19 @@ def run_units(
     agent_image: str | None = None,
     keep_inputs: bool = False,
     on_start: Callable[[list[pathlib.Path], str | None], None] | None = None,
+    prior_results: list[UnitResult] | None = None,
 ) -> list[UnitResult]:
+    """Run the agent over units. ``prior_results`` resumes an interrupted run: those units are
+    kept as they are, only the remaining ones run, and the summary covers all of them."""
     units = discover_units(units_dir, patterns)[: limit or None]
     if not units:
         raise ValueError(f"No units matched in {units_dir} (patterns={patterns or 'all'})")
+    planned = len(units)
+    prior = prior_results or []
+    finished = {r.unit for r in prior}
+    units = [u for u in units if u.name not in finished]
+    if prior:
+        logger.info("Resuming: %d units already finished, %d to run", len(prior), len(units))
     run_dir.mkdir(parents=True, exist_ok=True)
     check_image = checker_image if check and checker_available(checker_image) else None
     if on_start is not None:
@@ -396,6 +409,7 @@ def run_units(
             (check_image, timeout_override, agent_image, registry, keep_inputs),
             results,
             results_path,
+            append=bool(prior),
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted: cancelling pending units; writing a partial summary")
@@ -407,8 +421,34 @@ def run_units(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
-    results.sort(key=lambda r: r.unit)
-    write_summary(run_dir, results, checked=check_image is not None, planned=len(units))
+    results = sorted(prior + results, key=lambda r: r.unit)
+    checked = check_image is not None or any(r.reward is not None for r in prior)
+    write_summary(run_dir, results, checked=checked, planned=planned)
+    return results
+
+
+def load_results(run_dir: pathlib.Path) -> list[UnitResult]:
+    """Per-unit results an interrupted run already recorded (one per unit, last line wins).
+
+    A line cut off by the interruption is dropped, and the file is rewritten with the valid
+    lines so resumed results append cleanly.
+    """
+    path = run_dir / "results.jsonl"
+    if not path.is_file():
+        return []
+    fields = {f.name for f in dataclasses.fields(UnitResult)}
+    by_unit: dict[str, UnitResult] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("unit"):
+            by_unit[row["unit"]] = UnitResult(**{k: v for k, v in row.items() if k in fields})
+    results = list(by_unit.values())
+    path.write_text(
+        "".join(json.dumps(dataclasses.asdict(r)) + "\n" for r in results), encoding="utf-8"
+    )
     return results
 
 
@@ -419,9 +459,10 @@ def _collect(
     unit_args: tuple[str | None, float | None, str | None, set[str], bool],
     results: list[UnitResult],
     results_path: pathlib.Path,
+    append: bool = False,
 ) -> None:
     """Run units on ``pool``, appending each result (and a results.jsonl line) as it lands."""
-    with results_path.open("w") as sink:
+    with results_path.open("a" if append else "w") as sink:
         futures = {pool.submit(run_unit, u, run_dir, *unit_args): u for u in units}
         for done, future in enumerate(as_completed(futures), start=1):
             unit = futures[future]

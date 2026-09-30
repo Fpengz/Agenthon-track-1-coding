@@ -72,3 +72,19 @@ uv run python -m agent.main runs prune RUN_ID ...        # delete raw artifacts,
 ```
 
 `--no-register` skips the registry for throwaway smoke runs; `--run-dir` overrides the location.
+
+## Interrupted runs
+
+Runs started from a terminal or agent session die with it. Start long runs detached, and resume
+anything that was cut short:
+
+```bash
+setsid nohup uv run python -m agent.main solve-units ... > /dev/null 2>&1 &   # survives the session
+uv run python -m agent.main solve-units --resume verify-r1 -j 2             # run id, path or name
+```
+
+`--resume` reapplies the run's recorded settings, uses the recorded agent image ID (a rebuilt
+tag would change the code under test), keeps the units already in `results.jsonl`, reruns a unit
+that was mid-flight from a clean folder, appends the rest, and then writes the summary and the
+registry line. The manifest gains a `resumes` entry (when, how many units, which endpoint), so a
+run finished on a different server or load is visible as such.

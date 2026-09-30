@@ -237,3 +237,61 @@ def prune_run(run_dir: pathlib.Path) -> int:
     freed = sum(p.stat().st_size for p in run_dir.rglob("*") if p.is_file())
     shutil.rmtree(run_dir)
     return freed
+
+
+def find_run_dir(run: str, runs_dir: pathlib.Path = RUNS_DIR) -> pathlib.Path:
+    """The run directory for a run id, a path, or a unique name suffix (``verify-r1``)."""
+    direct = pathlib.Path(run)
+    if (direct / "manifest.json").is_file():
+        return direct.resolve()
+    if (runs_dir / run / "manifest.json").is_file():
+        return (runs_dir / run).resolve()
+    matches = sorted(p.parent for p in runs_dir.glob(f"*-{run}/manifest.json"))
+    if len(matches) != 1:
+        raise KeyError(f"run {run!r}: expected one match under {runs_dir}, found {len(matches)}")
+    return matches[0].resolve()
+
+
+def load_manifest(run_dir: pathlib.Path) -> dict[str, Any]:
+    return json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+
+def apply_settings(manifest: dict[str, Any]) -> None:
+    """Restore the run's behaviour settings into the environment (unset ones are removed), so a
+    resumed run behaves exactly as the original was configured."""
+    for var, value in manifest.get("settings", {}).items():
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = str(value)
+
+
+def resume_image(manifest: dict[str, Any]) -> str | None:
+    """The agent image to resume with: the recorded image ID when it still exists locally (a
+    rebuilt tag would silently change the agent under test), else the tag with a warning."""
+    tag, recorded = manifest.get("agent_image"), manifest.get("agent_image_id")
+    if not tag:
+        return None
+    if recorded and image_id(recorded) == recorded:
+        return recorded
+    logger.warning(
+        "Image ID %s is gone; resuming with tag %s (may be different code)", recorded, tag
+    )
+    return tag
+
+
+def note_resume(run_dir: pathlib.Path, manifest: dict[str, Any], remaining: int, jobs: int) -> None:
+    manifest.setdefault("resumes", []).append(
+        {
+            "at": now_utc(),
+            "units_remaining": remaining,
+            "jobs": jobs,
+            "endpoint": os.environ.get("MODEL_ENDPOINT"),
+            "git": git_state(),
+        }
+    )
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def is_registered(run_id: str, registry: pathlib.Path = REGISTRY) -> bool:
+    return any(e.get("run_id") == run_id for e in load_registry(registry))
