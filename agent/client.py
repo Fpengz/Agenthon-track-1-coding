@@ -76,6 +76,23 @@ _TRANSIENT_ERRORS = (
 )
 
 
+def _deadline_timeout(timeout: Any, remaining: float) -> float | openai.Timeout:
+    """Bound caller SDK timeouts without mutating options shared by concurrent requests."""
+    if isinstance(timeout, openai.Timeout):
+        return openai.Timeout(
+            **{
+                name: remaining if value is None else min(value, remaining)
+                for name, value in timeout.as_dict().items()
+            }
+        )
+    if timeout is None:
+        return remaining
+    if isinstance(timeout, (float, int)):
+        return min(timeout, remaining)
+    # The SDK's NOT_GIVEN sentinel uses the client's configured default.
+    return min(REQUEST_TIMEOUT_SEC, remaining)
+
+
 class HouseModelClient:
     """Client for interacting with the organizer-hosted model route ($MODEL_ENDPOINT)."""
 
@@ -147,20 +164,28 @@ class HouseModelClient:
         max_tokens: int = MAX_OUTPUT_TOKENS,
         temperature: float = 0.0,
         phase: str = "generate",
+        deadline: float | None = None,
         **kwargs: Any,
     ) -> ChatResult:
         """Send a completion request, retrying transient failures within the request budget.
 
         ``phase`` (generate / repair / review / continue / judge / verify / plan) selects the
         reasoning effort in hybrid mode.
+        ``deadline`` is an absolute ``time.monotonic()`` limit shared by a unit's requests.
         """
         for retry in range(TRANSIENT_RETRIES + 1):
             try:
-                return self._chat_once(messages, max_tokens, temperature, phase, **kwargs)
+                return self._chat_once(
+                    messages, max_tokens, temperature, phase, deadline=deadline, **kwargs
+                )
             except _TRANSIENT_ERRORS as exc:
                 if retry == TRANSIENT_RETRIES or self.request_count >= self.max_requests:
                     raise
                 delay = _RETRY_BACKOFF_SEC[min(retry, len(_RETRY_BACKOFF_SEC) - 1)]
+                if deadline is not None and deadline - time.monotonic() <= delay:
+                    raise TimeoutError(
+                        "The unit's House request deadline leaves no time to retry."
+                    ) from exc
                 logger.warning(
                     "Transient House error (%s); retrying in %.0fs", exc.__class__.__name__, delay
                 )
@@ -173,6 +198,7 @@ class HouseModelClient:
         max_tokens: int,
         temperature: float,
         phase: str,
+        deadline: float | None = None,
         **kwargs: Any,
     ) -> ChatResult:
         """One completion request, respecting the 25-request ceiling."""
@@ -182,6 +208,13 @@ class HouseModelClient:
         if template_kwargs is not None and "extra_body" not in kwargs:
             kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
         with self._lock:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("The unit's House request deadline has expired.")
+                kwargs["timeout"] = _deadline_timeout(
+                    kwargs.get("timeout", REQUEST_TIMEOUT_SEC), remaining
+                )
             if self.request_count >= self.max_requests:
                 logger.error(
                     "Model request limit reached (%d/%d)",

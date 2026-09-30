@@ -15,12 +15,17 @@ import math
 import pathlib
 import re
 import shutil
+from dataclasses import dataclass
 from typing import Any
+
+from agent.executor import ExecutionResult, strip_reasoning
 
 logger = logging.getLogger(__name__)
 
 HARNESS_FILES = frozenset({"reward.json", "pytest_report.json"})
 _VERDICT = re.compile(r"VERDICT:\s*\**\s*(PASS|FAIL)", re.IGNORECASE)
+_CHECK_LINE = re.compile(r"^[ \t]*(PASS|FAIL)[ \t]*:[ \t]*(.*)$", re.IGNORECASE | re.M)
+_ASSERTION = re.compile(r"^AssertionError(?:\s*:.*)?$", re.M)
 _MAX_FINDINGS = 25
 # Diagnostics must stay cheap: very large tables are sampled, and huge files skipped.
 _TABLE_MAX_BYTES = 200_000_000
@@ -101,8 +106,36 @@ def output_diagnostics(out_dir: pathlib.Path) -> list[str]:
 
 def parse_verdict(response: str) -> str | None:
     """``"PASS"``/``"FAIL"`` from the review response, or None if absent."""
-    matches = _VERDICT.findall(response)
+    matches = _VERDICT.findall(strip_reasoning(response))
     return matches[-1].upper() if matches else None
+
+
+@dataclass(frozen=True)
+class VerifierResult:
+    passes: int
+    failures: list[str]
+    incomplete: str = ""
+
+
+def verifier_result(run: ExecutionResult) -> VerifierResult:
+    """Separate executed check failures from a verifier that could not finish its checks.
+
+    Assertions are executed evidence even when the model omitted the requested FAIL print.
+    Other crashes need a repaired verifier; they do not establish a defect in the solution.
+    """
+    checks = _CHECK_LINE.findall(run.stdout)
+    passes = sum(kind.upper() == "PASS" for kind, _ in checks)
+    failures = [f"FAIL: {text}" for kind, text in checks if kind.upper() == "FAIL"]
+    if not run.success and not run.timed_out and _ASSERTION.search(run.stderr):
+        failures.append("FAIL: verifier assertion failed\n" + run.feedback)
+    if failures:
+        return VerifierResult(passes, failures)
+    if not run.success:
+        reason = "Verifier did not complete its checks: " + run.failure_kind
+        return VerifierResult(passes, [], reason + "\n" + run.feedback)
+    if not passes:
+        return VerifierResult(0, [], "Verifier ran but reported no PASS: or FAIL: checks.")
+    return VerifierResult(passes, [])
 
 
 def snapshot_outputs(out_dir: pathlib.Path, dest: pathlib.Path) -> None:

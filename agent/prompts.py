@@ -308,6 +308,21 @@ Report only real, specific defects.
 """
 
 
+def build_review_retry_prompt(review_prompt: str, previous_response: str) -> str:
+    """Finish an incomplete review while retaining its script and output evidence."""
+    return f"""{review_prompt}
+
+---
+Your previous review did not provide a complete verdict. The clean outputs are still saved.
+Finish the review and put `VERDICT: PASS` or `VERDICT: FAIL` FIRST in your final answer.
+For FAIL, include the concrete defects and the corrected script or edits requested above.
+Keep reasoning brief; do not spend the response budget repeating the analysis below.
+
+### PREVIOUS INCOMPLETE REVIEW (provisional, check against the specification):
+{_condense_notes(previous_response)}
+"""
+
+
 def build_judge_prompt(task_prompt: str, diffs: list[str], code_a: str, code_b: str) -> str:
     """Ask which of two disagreeing candidate solutions follows the specification.
 
@@ -370,7 +385,30 @@ execution rather than by reading.
    computation (they are tested and do not share the script's assumptions).
 4. Print one line per check, starting with `PASS:` or `FAIL:` and, for failures, the expected vs
    actual value. Exit with status 1 if any check fails, 0 otherwise.
+   Evaluate the checks before printing PASS. Catch individual assertion failures, print FAIL
+   with the assertion's values, and continue with the remaining checks.
 5. Keep it compact and put it in one ```python ... ``` block.
+"""
+
+
+def build_verifier_repair_prompt(verifier_prompt: str, verifier: str, feedback: str) -> str:
+    """Repair the verification program rather than an untested solution."""
+    return f"""{verifier_prompt}
+
+---
+The VERIFICATION SCRIPT could not complete its checks. Repair that verifier only. This error
+does not establish that the solution is wrong. Read the saved outputs from OUTPUT_DIR and
+inputs from TASK_DIR, do not write deliverables, and print PASS: or FAIL: for every check.
+
+### PREVIOUS VERIFICATION SCRIPT:
+```python
+{verifier or "# No complete verification script was returned."}
+```
+
+### VERIFIER FEEDBACK:
+{feedback[-4500:]}
+
+Return the complete repaired VERIFICATION SCRIPT in one ```python ... ``` block.
 """
 
 

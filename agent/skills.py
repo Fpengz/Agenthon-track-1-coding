@@ -84,46 +84,130 @@ def _series(values: Any) -> pd.Series:
     return pd.Series(values, dtype=float).dropna()
 
 
-def annualized_return(returns: Any, periods_per_year: int) -> float:
-    """Geometric annualised return of periodic simple returns."""
+def _return_conventions(return_type: str, annualization: str = "geometric") -> None:
+    if return_type not in {"simple", "log"}:
+        raise ValueError("return_type must be 'simple' or 'log' (decimal returns)")
+    if annualization not in {"geometric", "arithmetic"}:
+        raise ValueError("annualization must be 'geometric' or 'arithmetic'")
+
+
+def annualized_return(
+    returns: Any,
+    periods_per_year: int,
+    *,
+    return_type: str = "simple",
+    annualization: str = "geometric",
+) -> float:
+    """Annualised decimal return under an explicit convention.
+
+    geometric: simple returns compound via prod(1+r); log returns via exp(sum(r)),
+    then annualise the wealth growth. arithmetic: mean(r)*periods_per_year; for log
+    returns this is an annual LOG return, without exponentiation.
+    """
+    _return_conventions(return_type, annualization)
     r = _series(returns)
     if r.empty:
         return float("nan")
+    if annualization == "arithmetic":
+        return float(r.mean()) * periods_per_year
+    if return_type == "log":
+        return math.expm1(float(r.mean()) * periods_per_year)
     growth = float((1.0 + r).prod())
     return growth ** (periods_per_year / len(r)) - 1.0
 
 
-def annualized_vol(returns: Any, periods_per_year: int) -> float:
-    """Sample standard deviation (ddof=1) of periodic returns, scaled by sqrt(periods)."""
+def annualized_vol(returns: Any, periods_per_year: int, *, ddof: int = 1) -> float:
+    """Standard deviation of periodic returns scaled by sqrt(periods); ddof=1 is sample,
+    ddof=0 population. Pass the representation required by the specification unchanged."""
     r = _series(returns)
-    if len(r) < 2:
+    if len(r) <= ddof:
         return float("nan")
-    return float(r.std(ddof=1)) * math.sqrt(periods_per_year)
+    return float(r.std(ddof=ddof)) * math.sqrt(periods_per_year)
 
 
-def sharpe_ratio(returns: Any, periods_per_year: int, risk_free_per_period: float = 0.0) -> float:
-    """Annualised Sharpe ratio of excess periodic returns (mean / sample std * sqrt(periods))."""
-    excess = _series(returns) - risk_free_per_period
-    if len(excess) < 2:
+def sharpe_ratio(
+    returns: Any,
+    periods_per_year: int,
+    risk_free_per_period: float = 0.0,
+    *,
+    ddof: int = 1,
+    return_type: str = "simple",
+    annualization: str = "geometric",
+    sharpe_method: str = "arithmetic",
+    risk_free_annual: float | None = None,
+) -> float:
+    """Annualised excess return divided by annualised volatility.
+
+    arithmetic uses mean(r)*periods (an annual log mean for log returns);
+    annualized_return uses annualized_return(..., annualization=...) as its numerator.
+    Subtract risk_free_annual directly, or risk_free_per_period*periods if not supplied.
+    Never supply both risk-free arguments with a nonzero per-period rate. The specification
+    decides whether arithmetic Sharpe or CAGR-based Sharpe is wanted.
+    """
+    _return_conventions(return_type, annualization)
+    if sharpe_method not in {"arithmetic", "annualized_return"}:
+        raise ValueError("sharpe_method must be 'arithmetic' or 'annualized_return'")
+    if risk_free_annual is not None and risk_free_per_period != 0.0:
+        raise ValueError("supply either risk_free_annual or risk_free_per_period, not both")
+    r = _series(returns)
+    if len(r) <= ddof:
         return float("nan")
-    std = float(excess.std(ddof=1))
+    # Preserve the existing per-period excess-return calculation for default callers.
+    excess = r - risk_free_per_period
+    std = float(excess.std(ddof=ddof))
     if std == 0.0:
         return float("nan")
-    return float(excess.mean()) / std * math.sqrt(periods_per_year)
+    if sharpe_method == "arithmetic" and risk_free_annual is None:
+        return float(excess.mean()) / std * math.sqrt(periods_per_year)
+    annual_return = (
+        float(r.mean()) * periods_per_year
+        if sharpe_method == "arithmetic"
+        else annualized_return(
+            r, periods_per_year, return_type=return_type, annualization=annualization
+        )
+    )
+    annual_rf = (
+        risk_free_annual
+        if risk_free_annual is not None
+        else risk_free_per_period * periods_per_year
+    )
+    return (annual_return - annual_rf) / (std * math.sqrt(periods_per_year))
 
 
-def cumulative_returns(returns: Any) -> pd.Series:
-    """Compounded cumulative return path: (1 + r).cumprod() - 1."""
-    return (1.0 + pd.Series(returns, dtype=float).fillna(0.0)).cumprod() - 1.0
+def cumulative_returns(returns: Any, *, return_type: str = "simple") -> pd.Series:
+    """Compounded cumulative return path; simple: prod(1+r)-1, log: exp(cumsum(r))-1.
+    Missing observations are treated as zero, preserving the supplied index."""
+    _return_conventions(return_type)
+    r = pd.Series(returns, dtype=float).fillna(0.0)
+    if return_type == "log":
+        return pd.Series(np.expm1(r.cumsum().to_numpy()), index=r.index, name=r.name)
+    return (1.0 + r).cumprod() - 1.0
 
 
-def max_drawdown(values: Any, is_returns: bool = True) -> float:
-    """Maximum drawdown as a NEGATIVE fraction (e.g. -0.23), from returns or an equity curve."""
+def max_drawdown(
+    values: Any,
+    is_returns: bool = True,
+    *,
+    return_type: str = "simple",
+    include_initial: bool = True,
+) -> float:
+    """Maximum drawdown as a NEGATIVE fraction, from returns or an equity curve.
+    For returns, include_initial=True includes starting wealth 1.0; False uses only the
+    observed compounded path. Equity curves are used as supplied, without prepending wealth.
+    """
+    _return_conventions(return_type)
     series = pd.Series(values, dtype=float).dropna()
     if series.empty:
         return float("nan")
-    equity = (1.0 + series).cumprod() if is_returns else series
     if is_returns:
+        equity = (
+            pd.Series(np.exp(series.cumsum().to_numpy()), index=series.index)
+            if return_type == "log"
+            else (1.0 + series).cumprod()
+        )
+    else:
+        equity = series
+    if is_returns and include_initial:
         equity = pd.concat([pd.Series([1.0]), equity], ignore_index=True)  # include the start
     drawdown = equity / equity.cummax() - 1.0
     return float(drawdown.min())
@@ -296,23 +380,45 @@ def gbm_paths(
 
 
 def performance_summary(
-    returns: Any, periods_per_year: int, risk_free_per_period: float = 0.0, ddof: int = 1
+    returns: Any,
+    periods_per_year: int,
+    risk_free_per_period: float = 0.0,
+    ddof: int = 1,
+    *,
+    return_type: str = "simple",
+    annualization: str = "geometric",
+    sharpe_method: str = "arithmetic",
+    risk_free_annual: float | None = None,
+    include_initial: bool = True,
 ) -> dict[str, float]:
-    """Common performance statistics of periodic SIMPLE returns. annualized_return is
-    geometric; annualized_vol = std(ddof) * sqrt(periods); sharpe uses the arithmetic mean of
-    excess returns; max_drawdown is negative. Check each against the specification's formula."""
+    """Common performance statistics with explicit return/annualisation/Sharpe conventions.
+
+    Defaults preserve SIMPLE returns, geometric annualised return, arithmetic Sharpe,
+    sample std (ddof=1), and negative drawdown including starting wealth 1.0. Log returns
+    compound via exp(cumsum(r)); arithmetic annualisation reports the annual log mean.
+    sharpe_method='annualized_return' uses the chosen annualised return rather than the
+    arithmetic mean. Match every argument to the specification rather than relying on defaults.
+    """
+    _return_conventions(return_type, annualization)
     r = _series(returns)
-    excess = r - risk_free_per_period
-    std = float(r.std(ddof=ddof)) if len(r) > ddof else float("nan")
-    ex_std = float(excess.std(ddof=ddof)) if len(r) > ddof else float("nan")
+    total = math.expm1(float(r.sum())) if return_type == "log" else float((1.0 + r).prod() - 1.0)
     return {
-        "total_return": float((1.0 + r).prod() - 1.0) if len(r) else float("nan"),
-        "annualized_return": annualized_return(r, periods_per_year),
-        "annualized_vol": std * math.sqrt(periods_per_year),
-        "sharpe": float(excess.mean()) / ex_std * math.sqrt(periods_per_year)
-        if ex_std and ex_std == ex_std
-        else float("nan"),
-        "max_drawdown": max_drawdown(r),
+        "total_return": total if len(r) else float("nan"),
+        "annualized_return": annualized_return(
+            r, periods_per_year, return_type=return_type, annualization=annualization
+        ),
+        "annualized_vol": annualized_vol(r, periods_per_year, ddof=ddof),
+        "sharpe": sharpe_ratio(
+            r,
+            periods_per_year,
+            risk_free_per_period,
+            ddof=ddof,
+            return_type=return_type,
+            annualization=annualization,
+            sharpe_method=sharpe_method,
+            risk_free_annual=risk_free_annual,
+        ),
+        "max_drawdown": max_drawdown(r, return_type=return_type, include_initial=include_initial),
     }
 
 
@@ -342,10 +448,18 @@ _FAMILIES: list[tuple[str, str]] = [
     ),
     (
         r"sharpe|drawdown|annuali[sz]ed (return|vol)|cumulative return",
-        "- performance_summary(returns, periods_per_year, risk_free_per_period=0.0, ddof=1) ->\n"
-        "  dict total_return, annualized_return (geometric), annualized_vol, sharpe, max_drawdown\n"
-        "  (negative); also annualized_return, annualized_vol, sharpe_ratio, max_drawdown(values,\n"
-        "  is_returns=True), cumulative_returns.",
+        "- performance_summary(returns, periods_per_year, risk_free_per_period=0.0, ddof=1,\n"
+        "  return_type='simple', annualization='geometric', sharpe_method='arithmetic',\n"
+        "  risk_free_annual=None, include_initial=True) -> dict total_return, annualized_return,\n"
+        "  annualized_vol, sharpe, max_drawdown (negative). CHOOSE conventions from the spec:\n"
+        "  return_type='log' compounds exp(sum(r)); annualization='arithmetic' means mean(r)*\n"
+        "  periods (annual LOG mean for log returns), 'geometric' means compounded CAGR;\n"
+        "  sharpe_method='annualized_return' uses the selected annualised return in Sharpe,\n"
+        "  default 'arithmetic' uses mean(r)*periods; ddof=0 is population, 1 sample. Supply\n"
+        "  risk_free_annual OR risk_free_per_period. include_initial=False excludes wealth 1.0\n"
+        "  from drawdown. Also annualized_return, annualized_vol, sharpe_ratio, max_drawdown,\n"
+        "  cumulative_returns with corresponding keywords. Do not apply simple-return\n"
+        "  compounding to log returns or substitute CAGR for a required arithmetic mean.",
     ),
 ]
 

@@ -120,8 +120,10 @@ Generate → execute → self-repair loop, one House-model request per attempt:
 - Methods that spend the unused request budget (all default off; A/B pending):
   `HOUSE_REASONING=hybrid` (low effort for generation, off for review/repair/continuation; the
   not-honoured detector only judges generation replies), `AGENT_VERIFY=1` (model-written
-  verifier executed on a COPY of the outputs; explicit `FAIL:` lines drive a repair, and the
-  model may return its script unchanged to keep it; <= 2 rounds), `AGENT_PLAN=1` (one request
+  verifier executed on a fresh COPY of the outputs; `FAIL:` lines and failed assertions drive
+  a solution repair. A crashed, silent or truncated verifier gets one recovery request when
+  affordable; persistent incompleteness falls back to normal review. The model may return its
+  solution unchanged to reject a faulty verifier; <= 2 rounds), `AGENT_PLAN=1` (one request
   extracts a requirements checklist into every prompt), `AGENT_EXPLORE=K` (tool use: up to K
   ```explore snippets run read-only with output fed back before the final script),
   `AGENT_SKILLS=1` (advertise `agent_skills`, from `skills.py`, copied next to every script).
@@ -131,6 +133,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   -- textbook formulas tested against analytic values (never against a unit's checker), with
   conventions as explicit arguments; only the families a task's instruction mentions are listed
   (`skills_summary`), and the verifier is told to use them as its independent computation.
+  Performance helpers expose simple/log returns, arithmetic/geometric annualisation,
+  arithmetic/CAGR Sharpe, ddof, risk-free rate units and initial wealth for drawdown; choose
+  each convention from the task instruction. Existing helper defaults remain compatible.
   A/B pending. Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
   only re-read what the input previews already show; it stays off.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
@@ -142,7 +147,10 @@ Generate → execute → self-repair loop, one House-model request per attempt:
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt
-  (spec + script + output previews). `VERDICT: PASS` accepts; `VERDICT: FAIL` + a corrected script
+  (spec + script + output previews). A complete final `VERDICT: PASS` accepts; reasoning drafts
+  and missing or truncated verdicts are incomplete and get one recovery request when affordable.
+  If recovery remains incomplete, the last clean outputs are retained without a review pass.
+  `VERDICT: FAIL` + a corrected script
   goes through the normal run/repair path; a FAIL cut off before its script becomes a repair turn
   fed the review's findings. At most `MAX_REVIEWS` per unit and none after `REVIEW_DEADLINE_SEC`;
   once a clean run exists, rewrites get a tighter execution timeout (10x its runtime, 60-300 s);
@@ -182,12 +190,16 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   sometimes renamed (from `environment/data/stock_chars.pqt`). A submission never runs in the
   unit image, so the prompt lists each cited path -> its TASK_DIR file.
 - `executor.py` — `extract_python_code` strips inline reasoning up to the last `</think>`, accepts
-  only *closed* fenced blocks (prefers the last one that compiles) and returns `""` otherwise —
+  only *closed* final-answer fenced blocks (prefers the last one that compiles) and returns `""` otherwise —
   prose is never executed. `run_code` runs the script in a scratch temp dir (never in the output
   dir) with env vars `TASK_DIR` and `OUTPUT_DIR`.
 - `client.py` — `HouseModelClient` (OpenAI client at `$MODEL_ENDPOINT/v1`, bearer `$MODEL_TOKEN`,
   model `$MODEL_NAME`); enforces 25 requests/unit and ≤4,000 output tokens; `chat()` returns
   `ChatResult(content, finish_reason)` so truncation (`finish_reason == "length"`) is detectable.
+  Every solver call supplies its monotonic deadline: SDK timeouts and retry backoff are clipped
+  to remaining time, reserving execution time. Execution budget is checked before deleting
+  clean deliverables. HTTP timeouts bound individual phases, so the solver also checks time
+  after the response.
 - `prompts.py` — system/initial/repair/continuation/no-code prompts. The system prompt reports the
   running interpreter's library versions (the image's, at evaluation: pandas 3). Generated scripts must map the
   instruction's `/input` → `TASK_DIR` and `/output` → `OUTPUT_DIR` (paths differ between local runs

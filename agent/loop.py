@@ -41,6 +41,8 @@ from agent.prompts import (
     build_plan_prompt,
     build_repair_prompt,
     build_review_prompt,
+    build_review_retry_prompt,
+    build_verifier_repair_prompt,
     build_verify_prompt,
 )
 from agent.review import (
@@ -49,6 +51,7 @@ from agent.review import (
     parse_verdict,
     restore_outputs,
     snapshot_outputs,
+    verifier_result,
 )
 from agent.skills import skills_summary
 from agent.spec import DeliverableSpec, parse_spec, spec_problems
@@ -59,6 +62,8 @@ NO_CODE_MARKER = "\n\n### NOTE:\n"
 MAX_CONTINUATIONS = 2
 # Self-reviews of a clean run before it is accepted (each costs one House request).
 MAX_REVIEWS = int(os.environ.get("AGENT_MAX_REVIEWS", "2"))  # 0 disables review (A/B runs)
+MAX_REVIEW_RECOVERIES = 1
+MAX_VERIFIER_RECOVERIES = 1
 # No new review starts after this share of the unit's time budget (480 s at the default 600 s),
 # so reviews scale with AGENT_TIME_BUDGET_SEC instead of silently stopping under heavier load.
 REVIEW_DEADLINE_SHARE = 0.8
@@ -280,6 +285,17 @@ class AgentSolver:
     def _time_left(self) -> float:
         return self.deadline - time.monotonic()
 
+    def _chat(self, **kwargs):
+        """Clip request timeouts and retries to the budget, reserving execution time."""
+        return self.client.chat(
+            deadline=self.deadline - MIN_EXEC_TIMEOUT_SEC - 10,
+            **kwargs,
+        )
+
+    def _execution_timeout(self, cap: float, reserve: float = 10) -> int | None:
+        room = int(min(cap, self._time_left() - reserve))
+        return room if room >= MIN_EXEC_TIMEOUT_SEC else None
+
     def discover_inputs(self) -> list[pathlib.Path]:
         """Discover the input files supplied with the task.
 
@@ -483,6 +499,7 @@ class AgentSolver:
         partial_code = ""  # prefix of a script cut off at the output cap, while continuing it
         continuations = 0
         reviews = 0
+        review_recoveries = 0
         reviewing = False  # the pending request is a review of a clean run
         accepted_dir = work_dir / "accepted"  # snapshot of the latest clean run's outputs
         have_accepted = False
@@ -529,7 +546,7 @@ class AgentSolver:
                         if edit_base
                         else "generate"
                     )
-                    result = self.client.chat(
+                    result = self._chat(
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
@@ -586,8 +603,21 @@ class AgentSolver:
                     verdict = parse_verdict(result.content)
                     cut_off_fix = result.truncated and bool(extract_partial_code(result.content))
                     logger.info("Review verdict: %s (corrected script: %s)", verdict, bool(code))
-                    if verdict == "PASS" or (verdict is None and not (code or cut_off_fix)):
+                    if verdict == "PASS" and not result.truncated:
                         return self._accept(attempt, "review passed", reviewed_code)
+                    if (verdict is None and not (code or cut_off_fix)) or (
+                        verdict == "PASS" and result.truncated
+                    ):
+                        if review_recoveries < MAX_REVIEW_RECOVERIES and self._can_afford(1):
+                            review_recoveries += 1
+                            reviewing = True
+                            user_prompt = build_review_retry_prompt(
+                                user_prompt.split(NO_CODE_MARKER)[0], result.content
+                            )
+                            logger.warning("Review incomplete; requesting its final verdict")
+                            continue
+                        logger.warning("Review incomplete; keeping the last clean outputs")
+                        return self._accept(attempt, "review incomplete", reviewed_code)
                     if not (code or cut_off_fix):
                         # FAIL, but the reply ran out of tokens before the corrected script: turn the
                         # review's findings into an ordinary repair turn instead of accepting.
@@ -701,6 +731,14 @@ class AgentSolver:
                     continue
 
                 # Execute code in a scratch directory; deliverables go to out_dir.
+                exec_timeout = self._execution_timeout(
+                    min(EXEC_TIMEOUT_SEC, max(60.0, 10 * accepted_seconds))
+                    if have_accepted
+                    else EXEC_TIMEOUT_SEC
+                )
+                if exec_timeout is None:
+                    logger.warning("Not enough time left to execute; keeping the last clean run")
+                    break
                 self.clear_stale_deliverables(expected_deliverables)
                 started_at = time.time()
                 exec_result = run_code(
@@ -710,18 +748,7 @@ class AgentSolver:
                     task_dir=self.task_dir,
                     # Once a clean run exists, a rewrite that runs far longer is a regression, not
                     # a fix; cap it so it cannot burn the roster's shared wall-clock allowance.
-                    timeout_sec=max(
-                        MIN_EXEC_TIMEOUT_SEC,
-                        round(
-                            min(
-                                EXEC_TIMEOUT_SEC,
-                                max(60.0, 10 * accepted_seconds)
-                                if have_accepted
-                                else EXEC_TIMEOUT_SEC,
-                                self._time_left() - 10,
-                            )
-                        ),
-                    ),
+                    timeout_sec=exec_timeout,
                 )
 
                 # Check output files
@@ -828,6 +855,7 @@ class AgentSolver:
                     # to verify the outputs against the specification before accepting them.
                     findings = output_diagnostics(self.out_dir)
                     reviews += 1
+                    review_recoveries = 0
                     reviewing = True
                     continuations = 0
                     edit_base = code
@@ -951,12 +979,15 @@ class AgentSolver:
         OUTPUT_DIR points at a scratch directory, so exploration can never create or change
         deliverables.
         """
+        timeout = self._execution_timeout(EXPLORE_TIMEOUT_SEC, reserve=60)
+        if timeout is None:
+            return "(exploration skipped: insufficient time left)"
         run = run_code(
             snippet,
             work_dir / "explore",
             work_dir / "explore-out",
             task_dir=self.task_dir,
-            timeout_sec=int(min(EXPLORE_TIMEOUT_SEC, max(20.0, self._time_left() - 60))),
+            timeout_sec=timeout,
         )
         text = run.stdout.strip()
         if run.returncode != 0:
@@ -967,7 +998,7 @@ class AgentSolver:
         """One request: a numbered requirements checklist extracted from the specification."""
         prompt = build_plan_prompt(self._prompt_variants(self.out_dir)[0])
         try:
-            result = self.client.chat(
+            result = self._chat(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -985,58 +1016,78 @@ class AgentSolver:
     def _run_verifier(
         self, task_prompt: str, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path
     ) -> str:
-        """Model-written verification of a clean run; the failure report, or "" if it passed.
+        """Return executed failures, repairing an incomplete verifier once when affordable.
 
-        The verifier runs against a COPY of the accepted outputs, so it cannot alter the
-        deliverables. A verifier that crashes without reporting any FAIL is ignored: only
-        explicit, executed failures reach the repair loop.
+        Every execution gets a fresh COPY of the clean outputs. Assertions and explicit FAIL
+        lines reach the solution repair loop; other verifier errors repair the verifier first.
+        If verification remains incomplete, the normal review still evaluates the clean run.
         """
         prompt = build_verify_prompt(
             task_prompt,
             code,
             build_input_previews(self.out_dir, output_files(self.out_dir), label="OUTPUT_DIR"),
         )
+        base_prompt = prompt
         variants = self._prompt_variants(self.out_dir)
-        fitted = fit_to_context(prompt, task_prompt, variants)
-        if fitted is None:
-            return ""
-        try:
-            result = self.client.chat(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": fitted[0]},
-                ],
-                temperature=0.0,
-                max_tokens=fitted[2],
-                phase="verify",
-            )
-        except Exception:
-            logger.exception("Verifier request failed; skipping verification")
-            return ""
-        verifier = extract_python_code(result.content)
-        if not verifier:
-            return ""
-        copy_dir = work_dir / "verify-outputs"
-        if copy_dir.exists():
-            shutil.rmtree(copy_dir)
-        shutil.copytree(accepted_dir, copy_dir)
-        run = run_code(
-            verifier,
-            work_dir / "verify",
-            copy_dir,
-            task_dir=self.task_dir,
-            timeout_sec=int(min(VERIFY_TIMEOUT_SEC, max(30.0, self._time_left() - 30))),
-        )
-        failures = [ln for ln in run.stdout.splitlines() if ln.strip().startswith("FAIL")]
-        logger.info(
-            "Verifier: %d PASS, %d FAIL (returncode=%d)",
-            sum(ln.strip().startswith("PASS") for ln in run.stdout.splitlines()),
-            len(failures),
-            run.returncode,
-        )
-        if not failures:
-            return ""
-        return "Verifier failures:\n" + "\n".join(failures[:20])
+        for recovery in range(MAX_VERIFIER_RECOVERIES + 1):
+            fitted = fit_to_context(prompt, task_prompt, variants)
+            if fitted is None:
+                return ""
+            try:
+                result = self._chat(
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": fitted[0]},
+                    ],
+                    temperature=0.0,
+                    max_tokens=fitted[2],
+                    phase="verify",
+                )
+            except Exception:
+                logger.exception("Verifier request failed; continuing with normal review")
+                return ""
+            verifier = extract_python_code(result.content)
+            if verifier:
+                timeout = self._execution_timeout(VERIFY_TIMEOUT_SEC, reserve=30)
+                if timeout is None:
+                    logger.warning("Verification incomplete: insufficient execution time")
+                    return ""
+                copy_dir = work_dir / "verify-outputs"
+                if copy_dir.exists():
+                    shutil.rmtree(copy_dir)
+                shutil.copytree(accepted_dir, copy_dir)
+                run = run_code(
+                    verifier,
+                    work_dir / "verify",
+                    copy_dir,
+                    task_dir=self.task_dir,
+                    timeout_sec=timeout,
+                )
+                evidence = verifier_result(run)
+                logger.info(
+                    "Verifier: %d PASS, %d FAIL (returncode=%d)",
+                    evidence.passes,
+                    len(evidence.failures),
+                    run.returncode,
+                )
+                if evidence.failures:
+                    return "Verifier failures:\n" + "\n".join(evidence.failures[:20])[:6500]
+                if not evidence.incomplete and not result.truncated:
+                    return ""
+                feedback = evidence.incomplete or (
+                    "The verification response was truncated. Return a complete verifier "
+                    "including all required checks; the partial PASS checks are insufficient."
+                )
+            else:
+                feedback = (
+                    "No complete verification script was returned.\n" + result.content[-2500:]
+                )
+            logger.warning("Verification incomplete: %s", feedback[:200])
+            # One request to fix the verifier and one to fix the solution if it finds a defect.
+            if recovery >= MAX_VERIFIER_RECOVERIES or not self._can_afford(2):
+                return ""
+            prompt = build_verifier_repair_prompt(base_prompt, verifier, feedback)
+        return ""
 
     # ------------------------------------------------------------------ best-of-N consensus
 
@@ -1068,7 +1119,7 @@ class AgentSolver:
         if fitted is None:
             return a
         try:
-            result = self.client.chat(
+            result = self._chat(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": fitted[0]},

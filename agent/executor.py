@@ -78,9 +78,6 @@ def extract_python_code(text: str) -> str:
         and body.strip()
         and EDIT_MARKER not in body
     ]
-    if not blocks and _THINK_END in text:
-        # Reasoning ended without an answer block; fall back to blocks inside the reasoning.
-        return extract_python_code(text.replace(_THINK_END, ""))
     if not blocks:
         return ""
 
