@@ -126,6 +126,12 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   ```explore snippets run read-only with output fed back before the final script),
   `AGENT_SKILLS=1` (advertise `agent_skills`, vetted helpers from `skills.py` copied next to
   every script: strict JSON writer, table reader, annualisation, Sharpe, drawdown).
+- Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
+  (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
+  replaces the fixed review/verifier caps (up to 4 reviews / 3 verifier rounds while
+  "requests left and time left > n x latency + run time + margin"). Local latency (~22 s single
+  stream, ~43 s under A/B load) overstates the House route's, so A/B time figures are upper
+  bounds; the real latency is in any Development upload's logs (`completed in X s`).
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt

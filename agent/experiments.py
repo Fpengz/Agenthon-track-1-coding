@@ -43,6 +43,8 @@ SETTING_VARS = (
     "AGENT_PLAN",
     "AGENT_EXPLORE",
     "AGENT_SKILLS",
+    "AGENT_ADAPTIVE",
+    "HOUSE_LATENCY_PRIOR_SEC",
 )
 _SLUG = re.compile(r"[^a-z0-9]+")
 

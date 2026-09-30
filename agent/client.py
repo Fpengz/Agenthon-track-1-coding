@@ -57,6 +57,10 @@ DEFAULT_REASONING_MODE = "low"
 # client drops to "off" -- the documented control -- for the rest of the unit. Honoured low
 # effort reasons for ~200 characters.
 LOW_EFFORT_MAX_REASONING_CHARS = 4000
+# Request latency before any is observed (seconds). Local vLLM: ~22 s single-stream, ~43 s under
+# A/B load; the House route's speed is unknown, so the agent measures it as it goes.
+LATENCY_PRIOR_SEC = float(os.environ.get("HOUSE_LATENCY_PRIOR_SEC", "45"))
+_LATENCY_WINDOW = 8
 # Per-request HTTP timeout: a stalled call must not eat the unit's card time (the SDK default is
 # 10 minutes). A full 4,000-token reply takes ~25-50 s locally.
 REQUEST_TIMEOUT_SEC = float(os.environ.get("HOUSE_REQUEST_TIMEOUT", "300"))
@@ -87,6 +91,7 @@ class HouseModelClient:
         # Candidates may query concurrently (parallel consensus): admission to the 25-request
         # budget must be atomic.
         self._lock = threading.Lock()
+        self.latencies: list[float] = []  # seconds per successful request
 
         # Resolve endpoint origin
         endpoint_origin = base_url or os.environ.get("MODEL_ENDPOINT")
@@ -230,6 +235,8 @@ class HouseModelClient:
             )
             raise
 
+        with self._lock:
+            self.latencies.append(time.perf_counter() - started_at)
         choice = response.choices[0]
         content = choice.message.content or ""
         usage = getattr(response, "usage", None)
@@ -250,6 +257,14 @@ class HouseModelClient:
         if mode == "low" and phase == "generate":
             self._check_low_effort(content, choice.finish_reason)
         return ChatResult(content=content, finish_reason=choice.finish_reason)
+
+    def expected_latency(self) -> float:
+        """A cautious estimate of the next request's duration: p75 of the recent window."""
+        with self._lock:
+            recent = sorted(self.latencies[-_LATENCY_WINDOW:])
+        if not recent:
+            return LATENCY_PRIOR_SEC
+        return recent[min(len(recent) - 1, (3 * len(recent)) // 4)]
 
     def _mode_for(self, phase: str) -> str:
         if self.reasoning_mode != HYBRID:

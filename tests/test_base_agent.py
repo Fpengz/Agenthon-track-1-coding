@@ -821,3 +821,49 @@ def test_static_failure_is_repaired_without_running(tmp_path):
     assert client.request_count == 3
     assert "static check (found before running)" in client.prompts[1]
     assert _out(tmp_path) == '{"price": 1.5}'
+
+
+def test_expected_latency_is_a_cautious_recent_estimate():
+    from agent.client import LATENCY_PRIOR_SEC, HouseModelClient
+
+    client = HouseModelClient(base_url="http://127.0.0.1:9", model_name="x")
+    assert client.expected_latency() == LATENCY_PRIOR_SEC  # nothing observed yet
+    client.latencies = [100.0] * 5 + [10, 12, 11, 30, 9, 10, 11, 13]
+    assert client.expected_latency() == 13  # p75 of the last 8, old slow ones forgotten
+
+
+def _review_chain():
+    return [
+        _writer(1),
+        "VERDICT: FAIL\n- a\n" + _writer(2),
+        "VERDICT: FAIL\n- b\n" + _writer(3),
+        "VERDICT: PASS",
+    ]
+
+
+def test_adaptive_budget_reviews_more_on_a_fast_route(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "ADAPTIVE", True)
+    client = ScriptedClient(*_review_chain())
+    client.expected_latency = lambda: 5.0
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 4  # a third review fits (fixed policy stops at 2)
+    assert _out(tmp_path) == '{"price": 3}'
+
+
+def test_fixed_policy_stops_at_two_reviews(tmp_path):
+    client = ScriptedClient(*_review_chain())
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 3
+
+
+def test_adaptive_budget_stops_early_on_a_slow_route(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "ADAPTIVE", True)
+    client = ScriptedClient(*_review_chain())
+    client.expected_latency = lambda: 1000.0  # no review round fits the time left
+    assert _solver(tmp_path, client).run()
+    assert client.request_count == 1
+    assert _out(tmp_path) == '{"price": 1}'

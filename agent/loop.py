@@ -95,6 +95,13 @@ MAX_VERIFY = 2
 VERIFY_TIMEOUT_SEC = 120
 PLAN = os.environ.get("AGENT_PLAN", "0").strip().lower() in {"1", "true", "on"}
 MAX_CHECKLIST_CHARS = 3000
+# Adaptive evidence budget (AGENT_ADAPTIVE): instead of fixed caps (2 reviews, 2 verifier rounds,
+# reviews stop at 80% of the time budget), keep spending requests on evidence while
+# "requests left and time left > n x observed request latency" holds, up to these ceilings. A
+# fast House route then uses more of its 25 requests; a slow one stops early.
+ADAPTIVE = os.environ.get("AGENT_ADAPTIVE", "0").strip().lower() in {"1", "true", "on"}
+ADAPTIVE_MAX_REVIEWS = 4
+ADAPTIVE_MAX_VERIFY = 3
 # Tool use: up to AGENT_EXPLORE exploration snippets (run read-only, output fed back) before the
 # final script. Skills: the vetted agent_skills helpers are always importable; AGENT_SKILLS=1
 # advertises them in the prompt.
@@ -779,12 +786,13 @@ class AgentSolver:
                             "specification: required columns or keys are missing.",
                         )
                         continue
-                    if (
-                        VERIFY
-                        and verifies < MAX_VERIFY
-                        and self._requests_left() >= 3
-                        and self._time_left() > 2 * MIN_ATTEMPT_SEC
-                    ):
+                    verify_cap = ADAPTIVE_MAX_VERIFY if ADAPTIVE else MAX_VERIFY
+                    verify_affordable = (
+                        self._can_afford(3, accepted_seconds)
+                        if ADAPTIVE
+                        else self._requests_left() >= 3 and self._time_left() > 2 * MIN_ATTEMPT_SEC
+                    )
+                    if VERIFY and verifies < verify_cap and verify_affordable:
                         verifies += 1
                         report = self._run_verifier(initial_prompt, code, work_dir, accepted_dir)
                         if report:
@@ -808,7 +816,13 @@ class AgentSolver:
                         self.client, "request_count", 0
                     )
                     review_deadline = REVIEW_DEADLINE_SHARE * self.time_budget
-                    if reviews >= max_reviews or elapsed > review_deadline or requests_left < 2:
+                    if ADAPTIVE and max_reviews > 0:
+                        review_cap = max(max_reviews, ADAPTIVE_MAX_REVIEWS)
+                        out_of_budget = not self._can_afford(2, accepted_seconds)
+                    else:
+                        review_cap = max_reviews
+                        out_of_budget = elapsed > review_deadline or requests_left < 2
+                    if reviews >= review_cap or out_of_budget:
                         return self._accept(attempt, "no review budget left", reviewed_code)
                     # Exit code 0 and present files say nothing about correctness: ask the model
                     # to verify the outputs against the specification before accepting them.
@@ -1025,6 +1039,14 @@ class AgentSolver:
         return "Verifier failures:\n" + "\n".join(failures[:20])
 
     # ------------------------------------------------------------------ best-of-N consensus
+
+    def _can_afford(self, requests: int, run_sec: float = 0.0) -> bool:
+        """Whether ``requests`` more House requests (plus a script run) fit the remaining budget."""
+        latency = getattr(self.client, "expected_latency", lambda: 45.0)()
+        return (
+            self._requests_left() >= requests
+            and self._time_left() > requests * latency + run_sec + MIN_ATTEMPT_SEC
+        )
 
     def _requests_left(self) -> int:
         return getattr(self.client, "max_requests", 0) - getattr(self.client, "request_count", 0)
