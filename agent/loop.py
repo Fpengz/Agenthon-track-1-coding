@@ -7,7 +7,9 @@ import os
 import pathlib
 import re
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from openai.types.chat import ChatCompletionMessageParam
@@ -223,6 +225,8 @@ class AgentSolver:
         self.client = client or HouseModelClient()
         self.spec: list[DeliverableSpec] = []
         self.canaries: set[str] = set()
+        self.accepted_code = ""
+        self.stop_event = threading.Event()  # set when parallel candidates reach consensus
         self.time_budget = self._time_budget()
         self.deadline = time.monotonic() + self.time_budget
         logger.debug(
@@ -456,6 +460,9 @@ class AgentSolver:
         # Iterative execution & self-repair loop
         try:
             for attempt in range(1, attempts + 1):
+                if self.stop_event.is_set():
+                    logger.info("Stopping before attempt %d: consensus already reached", attempt)
+                    break
                 if self._time_left() < MIN_ATTEMPT_SEC:
                     logger.warning("Time budget exhausted before attempt %d; stopping", attempt)
                     break
@@ -801,37 +808,6 @@ class AgentSolver:
     def _requests_left(self) -> int:
         return getattr(self.client, "max_requests", 0) - getattr(self.client, "request_count", 0)
 
-    def _run_candidate(
-        self, label: str, expected: list[str], work_dir: pathlib.Path
-    ) -> tuple[str, str, pathlib.Path] | None:
-        """An independent solve into its own staging directory: ``(label, code, snapshot)``.
-
-        The prompt names the staging directory, so even a script that hardcodes the path shown
-        cannot overwrite the accepted deliverables in the real output directory.
-        """
-        staging = work_dir / f"out-{label}"
-        staging.mkdir(parents=True, exist_ok=True)
-        real_out = self.out_dir
-        self.out_dir = staging
-        try:
-            logger.info("Consensus: solving independent candidate %s", label)
-            ok = self._solve_loop(
-                self._prompt_variants(staging),
-                expected,
-                work_dir / f"work-{label}",
-                temperature=CANDIDATE_TEMPERATURE,
-                max_reviews=0,
-                max_attempts=CANDIDATE_ATTEMPTS,
-            )
-        finally:
-            self.out_dir = real_out
-        if not ok:
-            logger.info("Consensus: candidate %s produced no clean run", label)
-            return None
-        snapshot = work_dir / f"candidate-{label}"
-        snapshot_outputs(staging, snapshot)
-        return label, self.accepted_code, snapshot
-
     def _judge(
         self, a: tuple[str, str, pathlib.Path], b: tuple[str, str, pathlib.Path], diffs: list[str]
     ) -> tuple[str, str, pathlib.Path]:
@@ -865,74 +841,112 @@ class AgentSolver:
         logger.info("Consensus judge chose candidate %s (%s vs %s)", choice[0], a[0], b[0])
         return choice
 
-    def _solve_with_consensus(self, expected: list[str], work_dir: pathlib.Path) -> bool:
-        """Best-of-N: accept agreeing independent solutions; settle disagreements."""
-        full_deadline = self.deadline
-        # Candidate A: the full loop (repairs + review). Only a small reserve is held back:
-        # cutting A short costs units that the single loop solves late (smoke run).
-        reserve = min(
-            CANDIDATE_MIN_SEC * (CANDIDATES - 1), CANDIDATE_RESERVE_SHARE * self._time_left()
+    def _child(self, label: str, work_dir: pathlib.Path) -> AgentSolver:
+        """An independent candidate solver sharing the client, budget, deadline and prompt parts.
+
+        It writes to its own staging OUTPUT_DIR (named in its prompt), so no candidate can touch
+        the real deliverables or another candidate's outputs.
+        """
+        staging = work_dir / f"out-{label}"
+        staging.mkdir(parents=True, exist_ok=True)
+        child = AgentSolver(
+            self.task_dir, staging, max_retries=self.max_retries, client=self.client
         )
-        self.deadline = full_deadline - reserve
+        child.deadline, child.time_budget = self.deadline, self.time_budget
+        child.spec, child.canaries = self.spec, self.canaries
+        child._prompt_parts = self._prompt_parts
+        child.stop_event = self.stop_event
+        return child
+
+    @staticmethod
+    def _run_child(
+        label: str, child: AgentSolver, expected: list[str], work_dir: pathlib.Path
+    ) -> bool:
         try:
-            ok_a = self._solve_loop(
-                self._prompt_variants(self.out_dir), expected, work_dir / "work-A"
+            return child._solve_loop(
+                child._prompt_variants(child.out_dir),
+                expected,
+                work_dir / f"work-{label}",
+                # A is the regular loop (greedy, with review); the others are sampled and
+                # unreviewed, which keeps them independent and bounds their requests.
+                temperature=0.0 if label == "A" else CANDIDATE_TEMPERATURE,
+                max_reviews=MAX_REVIEWS if label == "A" else 0,
+                max_attempts=None if label == "A" else CANDIDATE_ATTEMPTS,
             )
-        finally:
-            self.deadline = full_deadline
-        candidates: list[tuple[str, str, pathlib.Path]] = []
-        if ok_a:
-            snapshot_outputs(self.out_dir, work_dir / "candidate-A")
-            candidates.append(("A", self.accepted_code, work_dir / "candidate-A"))
+        except Exception:
+            logger.exception("Consensus: candidate %s crashed", label)
+            return False
 
-        decided: tuple[str, str, pathlib.Path] | None = None
+    def _solve_with_consensus(self, expected: list[str], work_dir: pathlib.Path) -> bool:
+        """Best-of-N in PARALLEL: candidates solve concurrently as separate House requests.
+
+        The request budget is what goes unused (failing units averaged 7.7 of 25; 115 of 136
+        ended "accepted but wrong"), while the sequential version cost 521 s per unit. Running
+        candidates side by side spends requests, not wall-clock time. The first agreeing pair
+        stops the rest; otherwise the medoid (3+ clean) or a judge (2 clean) decides.
+        """
+        labels: list[str] = list("ABCDE"[:CANDIDATES])
+        children: dict[str, AgentSolver] = {label: self._child(label, work_dir) for label in labels}
+        clean: list[str] = []
         agreement: dict[tuple[str, str], float] = {}
-        for label in "BCDE"[: CANDIDATES - 1]:
-            if self._time_left() < CANDIDATE_MIN_SEC or self._requests_left() < 3:
-                logger.info("Consensus: no budget for candidate %s", label)
-                break
-            candidate = self._run_candidate(label, expected, work_dir)
-            if candidate is None:
-                continue
-            # A near-identical pair is strong evidence: stop early and submit the earlier one.
-            for earlier in candidates:
-                result = compare_outputs(earlier[2], candidate[2])
-                agreement[(earlier[0], candidate[0])] = result.score
-                logger.info(
-                    "Consensus: %s vs %s agreement %.3f", earlier[0], candidate[0], result.score
-                )
-                if result.agree:
-                    decided = earlier
-                    break
-            candidates.append(candidate)
-            if decided is not None:
-                break
+        decided: str | None = None
+        with ThreadPoolExecutor(max_workers=len(labels)) as pool:
+            futures = {
+                pool.submit(self._run_child, label, child, expected, work_dir): label
+                for label, child in children.items()
+            }
+            for future in as_completed(futures):
+                label = futures[future]
+                if not future.result():
+                    logger.info("Consensus: candidate %s produced no clean run", label)
+                    continue
+                for earlier in clean:
+                    pair = (earlier, label) if earlier < label else (label, earlier)
+                    result = compare_outputs(children[pair[0]].out_dir, children[pair[1]].out_dir)
+                    agreement[pair] = result.score
+                    logger.info("Consensus: %s vs %s agreement %.3f", *pair, result.score)
+                    if result.agree and decided is None:
+                        decided = pair[0]
+                        self.stop_event.set()  # the others stop at their next attempt
+                clean.append(label)
 
-        if decided is None and len(candidates) >= 3:
-            # Medoid: the candidate that agrees most with all the others (earliest on ties).
-            def support(c: tuple[str, str, pathlib.Path]) -> float:
-                return sum(v for pair, v in agreement.items() if c[0] in pair)
+        clean.sort()
+        if decided is None and len(clean) >= 3:
+            for i, x in enumerate(clean):  # candidates that finished after the others
+                for y in clean[i + 1 :]:
+                    if (x, y) not in agreement:
+                        agreement[(x, y)] = compare_outputs(
+                            children[x].out_dir, children[y].out_dir
+                        ).score
 
-            decided = max(candidates, key=support)
+            def support(label: str) -> float:
+                return sum(v for pair, v in agreement.items() if label in pair)
+
+            decided = max(clean, key=support)
             logger.info(
                 "Consensus medoid: %s (support %s)",
-                decided[0],
-                {c[0]: round(support(c), 3) for c in candidates},
+                decided,
+                {c: round(support(c), 3) for c in clean},
             )
-        elif decided is None and len(candidates) == 2:
-            first, second = candidates
-            decided = self._judge(first, second, compare_outputs(first[2], second[2]).diffs)
-        elif decided is None and candidates:
-            decided = candidates[0]  # a single clean candidate (the others failed)
+        elif decided is None and len(clean) == 2:
+            x, y = clean
+            pick = self._judge(
+                (x, children[x].accepted_code, children[x].out_dir),
+                (y, children[y].accepted_code, children[y].out_dir),
+                compare_outputs(children[x].out_dir, children[y].out_dir).diffs,
+            )
+            decided = pick[0]
+        elif decided is None and clean:
+            decided = clean[0]
         if decided is None:
             logger.error("Consensus: no candidate produced a clean run")
             return False
-        restore_outputs(decided[2], self.out_dir)
-        self._save_solution(decided[1])
+        restore_outputs(children[decided].out_dir, self.out_dir)
+        self._save_solution(children[decided].accepted_code)
         logger.info(
-            "Consensus: submitted candidate %s of %s (model_requests=%s)",
-            decided[0],
-            [c[0] for c in candidates],
+            "Consensus: submitted candidate %s of clean %s (model_requests=%s)",
+            decided,
+            clean,
             getattr(self.client, "request_count", "unknown"),
         )
         return True

@@ -1,6 +1,7 @@
 """Tests for the base agent implementation."""
 
 import pathlib
+import re
 import tempfile
 
 from agent.client import ChatResult
@@ -439,61 +440,6 @@ def _writer(price):
     return WRITE_OK.replace("1.5", str(price))
 
 
-def test_consensus_accepts_agreeing_candidates(tmp_path, monkeypatch):
-    from agent import loop
-
-    monkeypatch.setattr(loop, "CANDIDATES", 3)
-    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", _writer(1.5))
-    assert _solver(tmp_path, client).run()
-    assert client.request_count == 3  # A, A's review, B (agrees -> no C, no judge)
-    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 1.5}'
-
-
-def test_consensus_majority_overrules_candidate_a(tmp_path, monkeypatch):
-    from agent import loop
-
-    monkeypatch.setattr(loop, "CANDIDATES", 3)
-    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", _writer(2.5), _writer(2.5))
-    assert _solver(tmp_path, client).run()
-    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 2.5}'  # B and C agree
-
-
-def test_consensus_judge_settles_two_disagreeing_candidates(tmp_path, monkeypatch):
-    from agent import loop
-
-    monkeypatch.setattr(loop, "CANDIDATES", 2)
-    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", _writer(2.5), "B is right.\nCHOICE: B")
-    assert _solver(tmp_path, client).run()
-    assert client.request_count == 4
-    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 2.5}'
-
-
-def test_consensus_candidate_cannot_clobber_accepted_outputs(tmp_path, monkeypatch):
-    from agent import loop
-
-    monkeypatch.setattr(loop, "CANDIDATES", 2)
-    crash_after_write = WRITE_OK.replace(
-        "'{\"price\": 1.5}')", "'{\"price\": 9}'); raise SystemExit(1)"
-    )
-    client = ScriptedClient(_writer(1.5), "VERDICT: PASS", *[crash_after_write] * 8)
-    assert _solver(tmp_path, client).run()
-    assert (tmp_path / "out" / "r.json").read_text() == '{"price": 1.5}'  # B wrote only to staging
-
-
-def test_consensus_medoid_picks_the_most_supported_candidate(tmp_path, monkeypatch):
-    from agent import loop
-
-    def writer(p, q):
-        return WRITE_OK.replace('{"price": 1.5}', f'{{"p": {p}, "q": {q}}}')
-
-    monkeypatch.setattr(loop, "CANDIDATES", 3)
-    # A-B agree on p, B-C agree on q, A-C on nothing: B has the most support.
-    client = ScriptedClient(writer(1, 1), "VERDICT: PASS", writer(1, 2), writer(3, 2))
-    assert _solver(tmp_path, client).run()
-    assert client.request_count == 4  # no judge needed with three candidates
-    assert (tmp_path / "out" / "r.json").read_text() == '{"p": 1, "q": 2}'
-
-
 SPEC_INSTRUCTION = """# Task
 ### `/output/prices.csv`
 | Column | Type |
@@ -648,3 +594,88 @@ def test_low_effort_falls_back_to_off_when_not_honoured(monkeypatch):
     client.reasoning_mode = "low"
     client._check_low_effort("still thinking about the approach", "length")
     assert client.reasoning_mode == "off"  # cut off before any code
+
+
+class RoutedClient:
+    """Thread-safe test client: responses per consensus candidate, routed by the staging
+    directory (out-A, out-B, ...) named in the prompt; anything else goes to the judge."""
+
+    max_requests = 25
+
+    def __init__(self, judge=(), **per_candidate):
+        import threading
+
+        self.queues = {label: list(items) for label, items in per_candidate.items()}
+        self.queues["judge"] = list(judge)
+        self.request_count = 0
+        self.lock = threading.Lock()
+
+    def chat(self, messages, **kwargs):
+        match = re.search(r"out-([A-E])\b", messages[-1]["content"])
+        key = match.group(1) if match else "judge"
+        with self.lock:
+            self.request_count += 1
+            queue = self.queues.get(key) or []
+            content = queue.pop(0) if queue else "no more scripted replies"
+        return ChatResult(content=content, finish_reason="stop")
+
+
+def _consensus(tmp_path, monkeypatch, n, **client_args):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CANDIDATES", n)
+    client = RoutedClient(**client_args)
+    return _solver(tmp_path, client), client
+
+
+def _out(tmp_path):
+    return (tmp_path / "out" / "r.json").read_text()
+
+
+def test_parallel_consensus_accepts_agreeing_candidates(tmp_path, monkeypatch):
+    solver, _ = _consensus(
+        tmp_path, monkeypatch, 3,
+        A=[_writer(1.5), "VERDICT: PASS"], B=[_writer(1.5)], C=[_writer(1.5)],
+    )  # fmt: skip
+    assert solver.run()
+    assert _out(tmp_path) == '{"price": 1.5}'
+
+
+def test_parallel_consensus_agreeing_pair_overrules_candidate_a(tmp_path, monkeypatch):
+    solver, _ = _consensus(
+        tmp_path, monkeypatch, 3,
+        A=[_writer(1.5), "VERDICT: PASS"], B=[_writer(2.5)], C=[_writer(2.5)],
+    )  # fmt: skip
+    assert solver.run()
+    assert _out(tmp_path) == '{"price": 2.5}'  # B and C agree
+
+
+def test_parallel_consensus_judge_settles_two_candidates(tmp_path, monkeypatch):
+    solver, client = _consensus(
+        tmp_path, monkeypatch, 2,
+        A=[_writer(1.5), "VERDICT: PASS"], B=[_writer(2.5)], judge=["B is right.\nCHOICE: B"],
+    )  # fmt: skip
+    assert solver.run()
+    assert _out(tmp_path) == '{"price": 2.5}'
+    assert client.request_count == 4  # A, A's review, B, judge
+
+
+def test_parallel_consensus_medoid_picks_the_most_supported(tmp_path, monkeypatch):
+    def writer(p, q):
+        return WRITE_OK.replace('{"price": 1.5}', f'{{"p": {p}, "q": {q}}}')
+
+    solver, _ = _consensus(
+        tmp_path, monkeypatch, 3,
+        A=[writer(1, 1), "VERDICT: PASS"], B=[writer(1, 2)], C=[writer(3, 2)],
+    )  # fmt: skip
+    assert solver.run()
+    assert _out(tmp_path) == '{"p": 1, "q": 2}'  # B agrees partly with both others
+
+
+def test_parallel_consensus_candidates_cannot_clobber_each_other(tmp_path, monkeypatch):
+    crash = WRITE_OK.replace("'{\"price\": 1.5}')", "'{\"price\": 9}'); raise SystemExit(1)")
+    solver, _ = _consensus(
+        tmp_path, monkeypatch, 2, A=[_writer(1.5), "VERDICT: PASS"], B=[crash] * 8,
+    )  # fmt: skip
+    assert solver.run()
+    assert _out(tmp_path) == '{"price": 1.5}'  # B failed; its writes stayed in its staging dir

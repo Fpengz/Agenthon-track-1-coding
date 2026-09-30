@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -79,6 +80,9 @@ class HouseModelClient:
     ) -> None:
         self.max_requests = max_requests
         self.request_count = 0
+        # Candidates may query concurrently (parallel consensus): admission to the 25-request
+        # budget must be atomic.
+        self._lock = threading.Lock()
 
         # Resolve endpoint origin
         endpoint_origin = base_url or os.environ.get("MODEL_ENDPOINT")
@@ -160,21 +164,23 @@ class HouseModelClient:
         template_kwargs = REASONING_MODES[self.reasoning_mode]
         if template_kwargs is not None and "extra_body" not in kwargs:
             kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
-        if self.request_count >= self.max_requests:
-            logger.error(
-                "Model request limit reached (%d/%d)",
-                self.request_count,
-                self.max_requests,
-            )
-            raise RuntimeError(
-                f"Exceeded hard limit of {self.max_requests} model requests per unit. "
-                "Aborting further LLM calls to stay admissible under g2 gate."
-            )
+        with self._lock:
+            if self.request_count >= self.max_requests:
+                logger.error(
+                    "Model request limit reached (%d/%d)",
+                    self.request_count,
+                    self.max_requests,
+                )
+                raise RuntimeError(
+                    f"Exceeded hard limit of {self.max_requests} model requests per unit. "
+                    "Aborting further LLM calls to stay admissible under g2 gate."
+                )
+            self.request_count += 1
+            number = self.request_count
 
         # Enforce maximum 4,000 output tokens per request
         effective_max_tokens = min(max_tokens, MAX_OUTPUT_TOKENS)
 
-        self.request_count += 1
         started_at = time.perf_counter()
         prompt_characters = 0
         for message in messages:
@@ -184,7 +190,7 @@ class HouseModelClient:
         logger.info(
             "Sending model request %d/%d (model=%s, messages=%d, prompt_chars=%d, "
             "max_tokens=%d, temperature=%.2f)",
-            self.request_count,
+            number,
             self.max_requests,
             self.model,
             len(messages),
@@ -204,7 +210,7 @@ class HouseModelClient:
         except Exception as exc:
             logger.warning(
                 "Model request %d/%d failed after %.2fs: %s: %s",
-                self.request_count,
+                number,
                 self.max_requests,
                 time.perf_counter() - started_at,
                 exc.__class__.__name__,
@@ -220,7 +226,7 @@ class HouseModelClient:
         logger.info(
             "Model request %d/%d completed in %.2fs (response_chars=%d, "
             "prompt_tokens=%s, completion_tokens=%s, finish_reason=%s)",
-            self.request_count,
+            number,
             self.max_requests,
             time.perf_counter() - started_at,
             len(content),
@@ -228,7 +234,7 @@ class HouseModelClient:
             completion_tokens if completion_tokens is not None else "unknown",
             choice.finish_reason,
         )
-        self._save_transcript(messages, content, choice.finish_reason)
+        self._save_transcript(number, messages, content, choice.finish_reason)
         self._check_low_effort(content, choice.finish_reason)
         return ChatResult(content=content, finish_reason=choice.finish_reason)
 
@@ -248,7 +254,11 @@ class HouseModelClient:
             self.reasoning_mode = "off"
 
     def _save_transcript(
-        self, messages: list[ChatCompletionMessageParam], content: str, finish_reason: str | None
+        self,
+        number: int,
+        messages: list[ChatCompletionMessageParam],
+        content: str,
+        finish_reason: str | None,
     ) -> None:
         """Debug aid: with AGENT_TRANSCRIPT_DIR set, keep each request/response pair on disk."""
         directory = os.environ.get("AGENT_TRANSCRIPT_DIR")
@@ -257,7 +267,7 @@ class HouseModelClient:
         try:
             path = pathlib.Path(directory)
             path.mkdir(parents=True, exist_ok=True)
-            stem = path / f"{self.request_count:02d}"
+            stem = path / f"{number:02d}"
             prompt = "\n\n".join(f"[{m['role']}]\n{m.get('content')}" for m in messages)
             stem.with_suffix(".request.txt").write_text(prompt, encoding="utf-8")
             stem.with_suffix(".response.txt").write_text(
