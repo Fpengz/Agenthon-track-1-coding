@@ -129,8 +129,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   527 s/unit. Both arms passed 26 units at least once; the verifier improved 9 units and
   regressed 10. Keep verification off: the earlier v2 gain used lighter server load.
   `AGENT_PLAN=1` (one request
-  extracts a requirements checklist into every prompt), `AGENT_EXPLORE=K` (tool use: up to K
-  ```explore snippets run read-only with output fed back before the final script),
+  extracts a requirements checklist into every prompt), `AGENT_EXPLORE=K` (up to K compact
+  numerical probes across generation, repair and review; executed locally with stdout/errors
+  fed back to the same pending operation),
   `AGENT_SKILLS=1` (advertise `agent_skills`, from `skills.py`, copied next to every script).
   v1 (generic utilities) scored 0.203 vs 0.209: 134/141 scripts used `write_json` and nothing
   else. v2 adds domain reference implementations -- Black-Scholes/Greeks/implied vol, bond
@@ -146,9 +147,15 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   The expanded risk helpers add Student-t loss VaR/ES, normal-mixture inverse CDF/tail
   moments, and Gaussian KDE VaR/ES without repeated density integration, with optional CDF
   grid interpolation. These use upper-tail LOSSES (negate returns); component sigmas are
-  standard deviations. Tested against independent SciPy integrals; adoption A/B pending.
-  Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
-  only re-read what the input previews already show; it stays off.
+  standard deviations. Tested against independent SciPy integrals. The two-run eight-unit pilot
+  (`20261001-0924-tail-*`) passed 3/2 skills vs 2/2 control; this is insufficient to promote skills.
+  The original exploration prompt produced 161 input-preview repeats out of 164 snippets.
+  The revised prompt asks for numerical hypotheses and independent recomputation of an actual
+  output during review. Probes use fresh output copies; bounded observations remain in every
+  task-prompt variant, including repairs and reviews after context reduction, and identify the
+  solution turn they inspected. Truncated probes never execute or become solution continuations.
+  Exploration stays off until a matched A/B demonstrates a gain. See
+  [agent/feedback.md](agent/feedback.md) for the diagnosed transition failures and regression loop.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B pending): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
@@ -185,6 +192,8 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   repeats the previous attempt's so the model changes approach instead of re-patching. If the
   model copies the failing script back verbatim (near-deterministic even when sampling), it is
   not re-run: the next request asks for a fresh script from the task prompt without the old code.
+  The repeat-error signature comes from the exception before the structured variable dump;
+  changed locals must neither hide an identical exception nor label different exceptions alike.
   `AGENT_MAX_REVIEWS` (default 2; 0 disables) is forwarded into agent containers for A/B runs.
 - Edit-based repairs: for scripts of `EDIT_MODE_MIN_LINES`+ lines, repair and review prompts ask
   for SEARCH/REPLACE blocks (`apply_edits` in `executor.py`; exact match, then a unique

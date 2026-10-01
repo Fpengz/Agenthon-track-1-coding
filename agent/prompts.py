@@ -59,11 +59,17 @@ CRITICAL OPERATING RULES:
 
 _MAX_PATH_MAP_LINES = 40
 
-EXPLORE_INSTRUCTION = """5. Tool: you can run short exploration snippets before writing the final script (up to {k}).
-   Your FIRST reply must be ONLY a ```explore ... ``` block of Python that reads TASK_DIR and
-   prints what you need to get the solution right (exact columns/dtypes/date ranges of the inputs,
-   and a quick check of the key formula or library call). Do not write deliverables in it. Its
-   output comes back to you; then explore again if needed or reply with the final ```python ```.
+EXPLORE_INSTRUCTION = """5. Local numerical probes: up to {k} snippets across generation, repair and review.
+   Your FIRST reply must be ONLY one complete ```explore ... ``` Python block, under 60 lines.
+   Start with a comment naming a numerical question from this task and its expected invariant.
+   Test a formula, sign/scale convention, date alignment or library behaviour on a tiny synthetic
+   example or a bounded input sample. Print the competing values and numerical discrepancy.
+   Use the input previews for schemas; spend the probe on a computation that resolves uncertainty.
+   Keep input reads under TASK_DIR and use only local installed libraries. A probe's OUTPUT_DIR
+   is a scratch copy of the latest deliverables, so you can read results during repair/review.
+   Its stdout and errors come back before you write the solution or verdict. Resume the pending
+   operation after observing them. The task specification determines which convention to use;
+   a plausible number or a probe's PASS message alone does not establish correctness.
 """
 
 STRUCTURE_INSTRUCTION = """4. Structure the script as one function per deliverable that computes it and writes it to
@@ -468,14 +474,40 @@ Quote exact names. One short line per item, at most 30 items, no preamble.
 """
 
 
-def build_exploration_section(log: list[tuple[str, str]], steps_left: int) -> str:
-    """Previous exploration snippets and their outputs, appended to the generation prompt."""
+def build_exploration_section(log: list[tuple[str, str]]) -> str:
+    """Executed observations retained in every task-prompt variant and follow-up."""
     parts = ["\n### EXPLORATION SO FAR:"]
     for i, (snippet, output) in enumerate(log, 1):
         parts.append(f"#### Snippet {i}\n```python\n{snippet}\n```\nOutput:\n```\n{output}\n```")
     parts.append(
-        f"\nYou may explore {steps_left} more time(s), or reply with the final ```python``` script."
-        if steps_left
-        else "\nNo exploration left: reply with the final complete ```python ... ``` script now."
+        "\nUse these executed observations with their recorded solution turn. "
+        "Output observations from an earlier solution describe that version; "
+        "check new outputs again after changing the script."
     )
     return "\n".join(parts)
+
+
+def build_probe_instruction(steps_left: int, phase: str) -> str:
+    """Tool availability for the current operation, separate from persistent evidence."""
+    if phase == "continue":
+        return "\nContinue the pending solution script; probes are unavailable during continuation."
+    if not steps_left:
+        return (
+            f"\nNo exploration left: finish the pending {phase} in its requested format "
+            "(complete solution, repair edits, or review verdict)."
+        )
+    if phase == "review":
+        return (
+            f"\nLOCAL NUMERICAL REVIEW: {steps_left} probes remaining. Before your verdict, "
+            "independently recompute one important requested value from the specification and "
+            "task inputs, read its actual deliverable value using OUTPUT_DIR, and print both "
+            "values and their discrepancy. Reply ONLY with one complete ```explore``` block "
+            "under 60 lines. OUTPUT_DIR is a fresh scratch copy. The measured results return "
+            "to this review; then give the verdict and any repair."
+        )
+    return (
+        f"\nLOCAL PROBE AVAILABLE: {steps_left} remaining. To measure a specific numerical "
+        f"uncertainty before finishing this {phase}, reply ONLY with one complete ```explore``` "
+        "block (under 60 lines). OUTPUT_DIR is a fresh scratch copy of current deliverables. "
+        "Its results return to this same operation. Otherwise finish in the format requested above."
+    )

@@ -232,8 +232,10 @@ class ExecutionResult:
 
     @property
     def error_signature(self) -> str:
-        """Last non-empty stderr line (e.g. ``KeyError: ...``), to spot a repeated failure."""
-        lines = [ln.strip() for ln in self.stderr.splitlines() if ln.strip()]
+        """Exception tail before the hook's variable context, to spot a repeated failure."""
+        context = re.search(r"^\[agent\] failure type:", self.stderr, re.M)
+        traceback = self.stderr[: context.start()] if context else self.stderr
+        lines = [ln.strip() for ln in traceback.splitlines() if ln.strip()]
         return lines[-1][:300] if lines else ""
 
     @property

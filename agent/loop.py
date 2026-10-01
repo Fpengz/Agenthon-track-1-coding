@@ -39,6 +39,7 @@ from agent.prompts import (
     build_judge_prompt,
     build_no_code_prompt,
     build_plan_prompt,
+    build_probe_instruction,
     build_repair_prompt,
     build_review_prompt,
     build_review_retry_prompt,
@@ -114,15 +115,17 @@ MAX_CHECKLIST_CHARS = 3000
 ADAPTIVE = os.environ.get("AGENT_ADAPTIVE", "0").strip().lower() in {"1", "true", "on"}
 ADAPTIVE_MAX_REVIEWS = 4
 ADAPTIVE_MAX_VERIFY = 3
-# Tool use: up to AGENT_EXPLORE exploration snippets (run read-only, output fed back) before the
-# final script. Skills: the vetted agent_skills helpers are always importable; AGENT_SKILLS=1
-# advertises them in the prompt.
+# Up to AGENT_EXPLORE numerical probes across generation, repair and review. Each runs
+# locally on an output copy; observations return to the same pending operation.
+# Skills: the vetted helpers are always importable; AGENT_SKILLS=1 advertises them.
 EXPLORE_STEPS = max(0, int(os.environ.get("AGENT_EXPLORE", "0")))
 EXPLORE_TIMEOUT_SEC = 60
 EXPLORE_OUTPUT_CHARS = 2500
+EXPLORE_SOURCE_CHARS = 3000
 EXPLORE_LOG_CHARS = 7000
 SKILLS = os.environ.get("AGENT_SKILLS", "0").strip().lower() in {"1", "true", "on"}
-_EXPLORE_BLOCK = re.compile(r"^```[ \t]*explore[^\n]*\n(.*?)^```[ \t]*$", re.S | re.M)
+_EXPLORE_BLOCK = re.compile(r"^```[ \t]*explore[^\n]*\n(.*?)^```[ \t]*$", re.S | re.M | re.I)
+_EXPLORE_START = re.compile(r"^```[ \t]*explore\b", re.M | re.I)
 # One function per deliverable, failures isolated and reported together (fewer no-output units).
 STRUCTURED = os.environ.get("AGENT_STRUCTURED", "0").strip().lower() in {
     "1",
@@ -516,6 +519,7 @@ class AgentSolver:
         test_future: Future[str] | None = None,
     ) -> bool:
         """Generate, run and repair until a clean run is accepted; False if none was."""
+        base_variants = prompt_variants
         initial_prompt = prompt_variants[0]
         attempts = max_attempts or self.max_retries + 1
         # The conversation is rebuilt each turn instead of accumulated: the latest repair
@@ -530,6 +534,8 @@ class AgentSolver:
         accepted_dir = work_dir / "accepted"  # snapshot of the latest clean run's outputs
         have_accepted = False
         accepted_seconds = 0.0  # runtime of the accepted script
+        accepted_turn = 0
+        executed_turn = 0
         reviewed_code = ""
         last_error = ""
         last_failed_code = ""
@@ -559,12 +565,6 @@ class AgentSolver:
                     {"role": "user", "content": user_prompt},
                 ]
                 try:
-                    fitted = fit_to_context(user_prompt, initial_prompt, prompt_variants)
-                    if fitted is None:
-                        logger.error("Request cannot fit the model context window; stopping")
-                        break
-                    user_prompt, initial_prompt, max_tokens = fitted
-                    messages[1]["content"] = user_prompt
                     phase = (
                         "review"
                         if reviewing
@@ -574,6 +574,27 @@ class AgentSolver:
                         if edit_base
                         else "generate"
                     )
+                    probe_instruction = (
+                        build_probe_instruction(
+                            min(EXPLORE_STEPS - explore_steps, max(0, self._requests_left() - 1))
+                            if self._can_afford(2, EXPLORE_TIMEOUT_SEC)
+                            else 0,
+                            phase,
+                        )
+                        if EXPLORE_STEPS
+                        else ""
+                    )
+                    fitted = fit_to_context(
+                        user_prompt + probe_instruction, initial_prompt, prompt_variants
+                    )
+                    if fitted is None:
+                        logger.error("Request cannot fit the model context window; stopping")
+                        break
+                    request_prompt, initial_prompt, max_tokens = fitted
+                    # Keep phase instructions out of saved state; they change when the
+                    # pending operation or tool allowance changes.
+                    user_prompt = request_prompt.removesuffix(probe_instruction)
+                    messages[1]["content"] = request_prompt
                     result = self._chat(
                         messages=messages,
                         temperature=temperature,
@@ -584,31 +605,88 @@ class AgentSolver:
                     logger.exception("Failed to query the model on attempt %d", attempt)
                     break
 
+                answer = strip_reasoning(result.content)
+                if EXPLORE_STEPS and phase == "continue" and _EXPLORE_START.search(answer):
+                    user_prompt = (
+                        f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
+                        "Probes are unavailable during solution continuation and were NOT "
+                        "executed. Return only the remaining solution code as requested."
+                    )
+                    continue
+                if (
+                    EXPLORE_STEPS
+                    and phase != "continue"
+                    and _EXPLORE_START.search(answer)
+                    and result.truncated
+                ):
+                    # A closed early block does not make a truncated response complete.
+                    # An unclosed probe must not become a solution continuation either.
+                    user_prompt = (
+                        f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
+                        "Your probe response was truncated and was NOT executed. Reply with "
+                        "one complete compact ```explore``` block, or finish the pending "
+                        "solution, repair or review in its requested format."
+                    )
+                    logger.warning("Truncated probe was not executed; resuming %s", phase)
+                    continue
                 code = extract_python_code(result.content)
-                # The first generation must explore; if the reply ALSO carries a script, that script
-                # was written before seeing any data, so the exploration wins. Later replies with
-                # a script use the script.
+                # Execute a requested probe before interpreting a solution or verdict.
+                # Its observations must precede the decision, even if both were returned.
                 explore = (
-                    _EXPLORE_BLOCK.search(strip_reasoning(result.content))
-                    if EXPLORE_STEPS
-                    and phase == "generate"
-                    and not reviewing
-                    and (not code or explore_steps == 0)
-                    else None
+                    _EXPLORE_BLOCK.search(answer) if EXPLORE_STEPS and phase != "continue" else None
                 )
-                if explore and explore_steps < EXPLORE_STEPS:
-                    # Tool use: run the snippet read-only and hand its output back.
+                if (
+                    explore
+                    and explore_steps < EXPLORE_STEPS
+                    and self._can_afford(1, EXPLORE_TIMEOUT_SEC)
+                ):
+                    # Keep the pending repair/review and its edit base; probes never
+                    # delete or overwrite the actual clean deliverables.
                     explore_steps += 1
                     snippet = explore.group(1).strip()
-                    exploration_log.append((snippet, self._explore(snippet, work_dir)))
+                    observation = self._explore(
+                        snippet, work_dir, accepted_dir if have_accepted else self.out_dir
+                    )
+                    output_version = (
+                        f"clean solution turn {accepted_turn}"
+                        if have_accepted
+                        else f"partial solution turn {executed_turn}"
+                        if executed_turn
+                        else "no solution executed yet"
+                    )
+                    observation = f"Context: {phase}; output copy: {output_version}\n{observation}"
+                    source = (
+                        snippet
+                        if len(snippet) <= EXPLORE_SOURCE_CHARS
+                        else snippet[:EXPLORE_SOURCE_CHARS] + "\n# [source excerpt truncated]"
+                    )
+                    exploration_log.append((source, observation))
                     while (
                         len(exploration_log) > 1
                         and sum(len(a) + len(b) for a, b in exploration_log) > EXPLORE_LOG_CHARS
                     ):
                         exploration_log.pop(0)
-                    logger.info("Exploration step %d/%d", explore_steps, EXPLORE_STEPS)
-                    user_prompt = initial_prompt + build_exploration_section(
-                        exploration_log, EXPLORE_STEPS - explore_steps
+                    logger.info(
+                        "Exploration step %d/%d during %s; resuming %s",
+                        explore_steps,
+                        EXPLORE_STEPS,
+                        phase,
+                        phase,
+                    )
+                    # Evidence is required context, including after a repair, review or
+                    # context-window fallback. Preserve the pending operation's suffix.
+                    suffix = user_prompt[len(initial_prompt) :]
+                    variant_index = prompt_variants.index(initial_prompt)
+                    evidence = build_exploration_section(exploration_log)
+                    prompt_variants = [base + evidence for base in base_variants]
+                    initial_prompt = prompt_variants[variant_index]
+                    user_prompt = initial_prompt + suffix
+                    continue
+                if explore and not code:
+                    user_prompt = (
+                        f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
+                        "The probe was NOT executed: no tool allowance or follow-up budget "
+                        "remains. Finish the pending operation in its requested format."
                     )
                     continue
                 if edit_base:
@@ -769,6 +847,7 @@ class AgentSolver:
                     break
                 self.clear_stale_deliverables(expected_deliverables)
                 started_at = time.time()
+                executed_turn = attempt
                 exec_result = run_code(
                     code=code,
                     work_dir=work_dir,
@@ -821,6 +900,7 @@ class AgentSolver:
                     snapshot_outputs(self.out_dir, accepted_dir)
                     have_accepted = True
                     accepted_seconds = exec_result.duration
+                    accepted_turn = attempt
                     reviewed_code = code
                     last_error = ""
                     problems = spec_problems(self.spec, self.out_dir) if self.spec else []
@@ -1032,26 +1112,31 @@ class AgentSolver:
 
     # ------------------------------------------------------------------ extra evidence
 
-    def _explore(self, snippet: str, work_dir: pathlib.Path) -> str:
+    def _explore(self, snippet: str, work_dir: pathlib.Path, source_out_dir: pathlib.Path) -> str:
         """Run an exploration snippet; its output (bounded) for the next prompt.
 
-        OUTPUT_DIR points at a scratch directory, so exploration can never create or change
-        deliverables.
+        OUTPUT_DIR points at a fresh copy, so a probe can inspect the latest results
+        without changing deliverables. Its exit status and errors are observations.
         """
         timeout = self._execution_timeout(EXPLORE_TIMEOUT_SEC, reserve=60)
         if timeout is None:
             return "(exploration skipped: insufficient time left)"
+        probe_outputs = work_dir / "explore-out"
+        snapshot_outputs(source_out_dir, probe_outputs)
+        timeout = self._execution_timeout(EXPLORE_TIMEOUT_SEC, reserve=60)
+        if timeout is None:
+            return "(exploration skipped: insufficient time left after copying outputs)"
         run = run_code(
             snippet,
             work_dir / "explore",
-            work_dir / "explore-out",
+            probe_outputs,
             task_dir=self.task_dir,
             timeout_sec=timeout,
         )
-        text = run.stdout.strip()
-        if run.returncode != 0:
-            text = f"{text}\n[exit {run.returncode}]\n{run.feedback}".strip()
-        return text[-EXPLORE_OUTPUT_CHARS:] or "(no output)"
+        status = f"[exit {run.returncode}]" + (" [timed out]" if run.timed_out else "")
+        text = run.feedback.strip() or "(no output)"
+        logger.info("Probe execution: %s, %.2fs", status, run.duration)
+        return status + "\n" + text[-EXPLORE_OUTPUT_CHARS:]
 
     def _requirements_checklist(self) -> str:
         """One request: a numbered requirements checklist extracted from the specification."""

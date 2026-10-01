@@ -58,6 +58,168 @@ def price(tmp_path):
     return json.loads((tmp_path / "out" / "r.json").read_text())["price"]
 
 
+@pytest.mark.parametrize("failed_solution", [False, True])
+def test_numeric_probe_evidence_survives_repair_and_review(tmp_path, monkeypatch, failed_solution):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    responses = ["```explore\nprint('measured_tail_mean=2.5')\n```"]
+    if failed_solution:
+        responses.append("```python\nraise ValueError('wrong_tail_convention')\n```")
+    responses.extend([writer(2.5), "VERDICT: PASS"])
+    client = RecordedClient(*responses)
+    assert solver_for(tmp_path, client).run()
+    followups = [
+        prompt for prompt, kwargs in client.requests if kwargs["phase"] in {"repair", "review"}
+    ]
+    assert followups
+    assert all("measured_tail_mean=2.5" in prompt for prompt in followups)
+
+
+@pytest.mark.parametrize("closing_fence", ["\n```", ""])
+def test_truncated_probe_is_not_executed(tmp_path, monkeypatch, closing_fence):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    snippet = (
+        "import os, pathlib\n(pathlib.Path(os.environ['TASK_DIR']) / 'partial_probe_ran').touch()"
+    )
+    client = RecordedClient(
+        ChatResult(f"```explore\n{snippet}\n{closing_fence}", "length"),
+        writer(2.5),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert not (solver.task_dir / "partial_probe_ran").exists()
+    assert client.requests[1][1]["phase"] == "generate"
+
+
+def test_repair_can_probe_without_losing_the_failure_or_previous_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    client = RecordedClient(
+        "```explore\nprint('first_measurement=2.5')\n```",
+        "```python\nraise ValueError('wrong_tail_convention')\n```",
+        "```explore\nprint('independent_tail_integral=2.5')\n```",
+        writer(2.5),
+        "VERDICT: PASS",
+    )
+    assert solver_for(tmp_path, client).run()
+    prompt, kwargs = client.requests[3]
+    assert kwargs["phase"] == "repair"
+    assert "first_measurement=2.5" in prompt
+    assert "independent_tail_integral=2.5" in prompt
+    assert "wrong_tail_convention" in prompt
+    assert "raise ValueError('wrong_tail_convention')" in prompt
+
+
+def test_review_probe_reads_a_fresh_output_copy_and_resumes_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    review_probe = (
+        "```explore\nimport json, os, pathlib\n"
+        "p = pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json'\n"
+        "print('observed_price=', json.loads(p.read_text())['price'])\n"
+        "p.write_text('{}')\n```"
+    )
+    client = RecordedClient(
+        "```explore\nprint('toy_price=2.5')\n```", writer(2.5), review_probe, "VERDICT: PASS"
+    )
+    assert solver_for(tmp_path, client).run()
+    prompt, kwargs = client.requests[-1]
+    assert kwargs["phase"] == "review"
+    assert "observed_price= 2.5" in prompt
+    assert "SCRIPT STDOUT" in prompt
+    assert price(tmp_path) == 2.5
+
+
+def test_review_probe_assertion_evidence_drives_a_numerical_fix(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    probe = PRICE_TEST.replace("```python", "```explore")
+    client = RecordedClient(
+        "```explore\nprint('independent_price=2.5')\n```",
+        writer(1.5),
+        probe,
+        "VERDICT: FAIL\n" + writer(2.5),
+        "VERDICT: PASS",
+    )
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    prompt, kwargs = client.requests[3]
+    assert kwargs["phase"] == "review"
+    assert "AssertionError: price expected 2.5 got 1.5" in prompt
+    assert "[exit 1]" in prompt
+    assert "output copy: clean solution turn 2" in prompt
+
+
+def test_probe_cannot_become_a_solution_continuation(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    partial = "```python\nimport os, pathlib\nout = pathlib.Path(os.environ['OUTPUT_DIR'])\n"
+    client = RecordedClient(
+        "```explore\nprint('independent_price=2.5')\n```",
+        ChatResult(partial, "length"),
+        "```explore\nimport os, pathlib\n(pathlib.Path(os.environ['TASK_DIR']) / 'unexpected_probe').touch()\n```",
+        "```python\n(out / 'r.json').write_text('{\"price\": 2.5}')\n```",
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert price(tmp_path) == 2.5
+    assert not (solver.task_dir / "unexpected_probe").exists()
+    assert client.requests[3][1]["phase"] == "continue"
+
+
+def test_probe_evidence_survives_context_window_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    client = RecordedClient(
+        "```explore\nprint('measured_price=2.5')\n```", writer(2.5), "VERDICT: PASS"
+    )
+    solver = solver_for(tmp_path, client)
+    original_variants = solver._prompt_variants
+
+    def rich_variants(*args, **kwargs):
+        variants = original_variants(*args, **kwargs)
+        return [variants[0] + "\nOPTIONAL LARGE PREVIEW\n" + "x" * 16000, *variants]
+
+    monkeypatch.setattr(solver, "_prompt_variants", rich_variants)
+
+    def shrink_after_probe(number):
+        if number == 1:
+            monkeypatch.setattr(loop, "CONTEXT_TOKENS", 6500)
+
+    client.after_response = shrink_after_probe
+    assert solver.run()
+    assert "OPTIONAL LARGE PREVIEW" in client.requests[0][0]
+    assert "OPTIONAL LARGE PREVIEW" not in client.requests[1][0]
+    assert all("measured_price=2.5" in prompt for prompt, _ in client.requests[1:])
+
+
+def test_exhausted_probe_allowance_keeps_clean_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    client = RecordedClient(
+        "```explore\nprint('measured_price=2.5')\n```",
+        writer(2.5),
+        "```explore\nimport os, pathlib\n(pathlib.Path(os.environ['TASK_DIR']) / 'extra_probe_ran').touch()\n```",
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert not (solver.task_dir / "extra_probe_ran").exists()
+    assert price(tmp_path) == 2.5
+    assert "was NOT executed" in client.requests[-1][0]
+    assert client.requests[-1][1]["phase"] == "review"
+
+
+@pytest.mark.parametrize("same_error", [True, False])
+def test_repeated_failure_detection_uses_the_exception_not_local_variables(tmp_path, same_error):
+    first = "```python\nmapping = {'a': 1}\nvalue = mapping['missing']\n```"
+    second = (
+        "```python\nmapping = {'b': 1}\nvalue = mapping['missing']\n```"
+        if same_error
+        else "```python\nmapping = {'a': 1}\nvalue = mapping['other_missing']\n```"
+    )
+    client = RecordedClient(first, second, writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    repair, kwargs = client.requests[2]
+    assert kwargs["phase"] == "repair"
+    assert ("SAME error" in repair) == same_error
+
+
 class SpecTestClient(RecordedClient):
     """Synchronise the two initial calls to prove generation overlaps test writing."""
 
