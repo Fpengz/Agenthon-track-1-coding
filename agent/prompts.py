@@ -409,7 +409,7 @@ input information above. The solution and its outputs are unavailable to you.
    deliverable files from out. These files will exist when your tests execute. Read original
    inputs from TASK_DIR as needed for independent expected values, using the mapping above.
    Treat all files as read-only. Return tests, rather than a program that writes deliverables.
-2. Independently compute 2-4 representative numerical results from the supplied input files.
+2. Independently compute TWO representative numerical results from the supplied input files.
    Use the specification's exact formulas, filters, timing, units and conventions. Check values
    against the LOADED DELIVERABLE values by their stated row identifiers or keys. Prefer small
    direct calculations over implementing the entire solution. If agent_skills helpers are
@@ -422,7 +422,8 @@ input information above. The solution and its outputs are unavailable to you.
    requirement, expected value and actual value. Catch assertion failures separately so the
    remaining checks run. Exit 1 if any check fails and 0 otherwise. Print PASS only after
    executing a comparison. Missing required files or fields are failures.
-5. Keep reasoning brief and the program compact. Return one complete ```python ... ``` block.
+5. Keep the program UNDER 80 LINES. Prioritize the two numerical comparisons and essential
+   output schema checks. Return one complete ```python ... ``` block with no preamble.
 """
 
 

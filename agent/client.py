@@ -300,6 +300,10 @@ class HouseModelClient:
         return recent[min(len(recent) - 1, (3 * len(recent)) // 4)]
 
     def _mode_for(self, phase: str) -> str:
+        # Independent tests need their token cap for executable comparisons. Keep the low
+        # generation policy, but avoid spending the test request on inline reasoning.
+        if phase == "tests" and self.reasoning_mode == "low":
+            return "off"
         if self.reasoning_mode != HYBRID:
             return self.reasoning_mode
         return self.hybrid_generate_mode if phase == "generate" else "off"

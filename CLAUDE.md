@@ -151,7 +151,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   or test-program crashes fall back to normal review. An execution audit requires a suite to
   actually open deliverables for reading; input-only checks supply no output evidence.
   The solution can reject a faulty test by
-  returning its script unchanged. Generation is capped at 120 s; tests are not used with
+  returning its script unchanged. Under low reasoning, the test request disables thinking to
+  reserve the 4,000-token cap for a compact executable suite; solution generation stays low.
+  Generation is capped at 120 s; tests are not used with
   consensus candidates. Record and forward this switch in all experiment/container runs.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
   (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
