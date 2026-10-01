@@ -27,6 +27,7 @@ from agent.executor import (
     run_code,
     strip_reasoning,
 )
+from agent.guardrails import OutputGuardrails, derive_guardrails
 from agent.inputs import build_input_previews
 from agent.knowledge import domain_notes, read_card
 from agent.preflight import preflight
@@ -96,6 +97,8 @@ CANDIDATE_RESERVE_SHARE = 0.3
 # run trigger up to MAX_SPEC_REPAIRS repair turns. Off by default until A/B-tested.
 SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", "true", "on"}
 MAX_SPEC_REPAIRS = 2
+GUARDRAILS = os.environ.get("AGENT_GUARDRAILS", "0").strip().lower() in {"1", "true", "on"}
+MAX_GUARD_REPAIRS = 3
 # Few-shot reference examples from agent/examples/library.jsonl (rule 8: OTHER units only).
 EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true", "on"}
 # Model-written verification tests (executed on a COPY of the outputs) after a clean run, and a
@@ -276,6 +279,8 @@ class AgentSolver:
         self.max_retries = max_retries
         self.client = client or HouseModelClient()
         self.spec: list[DeliverableSpec] = []
+        self.guardrails: OutputGuardrails | None = None
+        self._probe_failures: list[str] = []
         self.canaries: set[str] = set()
         self.accepted_code = ""
         self.stop_event = threading.Event()  # set when parallel candidates reach consensus
@@ -442,6 +447,9 @@ class AgentSolver:
         self.canaries = task_canaries(self.task_dir, instruction_text)
         instruction_text = sanitize_instruction(instruction_text, self.canaries)
         self.spec = parse_spec(instruction_text, expected_deliverables) if SPEC_CHECKS else []
+        self.guardrails = (
+            derive_guardrails(instruction_text, expected_deliverables) if GUARDRAILS else None
+        )
         self._prompt_parts = _PromptParts(
             instruction_text=instruction_text,
             discovered_files=relative_inputs,
@@ -503,6 +511,9 @@ class AgentSolver:
                 task_facts=parts.task_facts,
                 skills_summary=skills_summary(parts.instruction_text) if SKILLS else "",
                 explore_steps=EXPLORE_STEPS if not tests_only else 0,
+                validation_guidance=self.guardrails.guidance
+                if self.guardrails and not tests_only
+                else "",
                 **{
                     k: v
                     for k, v in parts.optional.items()
@@ -545,12 +556,18 @@ class AgentSolver:
         last_failed_code = ""
         last_feedback = ""
         edit_base = ""  # the script shown in the pending repair/review prompt (edits apply to it)
+        edit_failures = 0
         spec_repairs = 0
+        guard_repairs = 0
+        accepted_problems: list[str] = []
+        failed_output_probe = ""
         verifies = 0
         explore_steps = 0
         initial_probe_done = False
         review_probe_done = False
         probe_recoveries = 0
+        probe_retry: tuple[str, str] | None = None
+        probe_retry_used = False
         exploration_log: list[tuple[str, str]] = []
         verify_code = ""  # the script a verifier-driven repair was asked about
         test_code: str | None = None
@@ -587,7 +604,8 @@ class AgentSolver:
                         else 0
                     )
                     explicit_probe = bool(
-                        probe_allowance
+                        probe_retry
+                        or probe_allowance
                         and (
                             (pending_phase == "generate" and not initial_probe_done)
                             or (pending_phase == "review" and not review_probe_done)
@@ -608,6 +626,25 @@ class AgentSolver:
                         if EXPLORE_STEPS
                         else ""
                     )
+                    if probe_retry:
+                        probe_instruction += (
+                            "\n### REPAIR THE CRASHED PROBE:\n"
+                            "Repair this diagnostic program, retaining its numerical question. "
+                            "Return the complete compact probe in Python; its execution failed "
+                            "before establishing correctness.\n```python\n"
+                            + probe_retry[0]
+                            + "\n```\n"
+                            + probe_retry[1]
+                        )
+                    elif GUARDRAILS and explicit_probe:
+                        probe_retry_used = False
+                        probe_instruction += (
+                            "\nCover the highest-risk requested stages: check units/signs and a "
+                            "limiting-case identity. During review, inspect multiple actual "
+                            "results, including a cross/edge case; recompute from inputs. "
+                            "Print CHECK name, computed value, output value, discrepancy and "
+                            "PASS/FAIL. Establish source correctness as well as summary consistency.\n"
+                        )
                     fitted = fit_to_context(
                         user_prompt + probe_instruction,
                         initial_prompt,
@@ -654,6 +691,7 @@ class AgentSolver:
                             review_probe_done |= pending_phase == "review"
                             explore_steps += 1
                             probe_recoveries = 0
+                            probe_retry = None
                         user_prompt = (
                             f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
                             "The previous numerical probe response was incomplete and was NOT "
@@ -698,12 +736,13 @@ class AgentSolver:
                 snippet = explore.group(1).strip() if explore else code if explicit_probe else ""
                 if (
                     snippet
-                    and explore_steps < EXPLORE_STEPS
+                    and (probe_retry or explore_steps < EXPLORE_STEPS)
                     and self._can_afford(1, EXPLORE_TIMEOUT_SEC)
                 ):
                     # Keep the pending repair/review and its edit base; probes never
                     # delete or overwrite the actual clean deliverables.
-                    explore_steps += 1
+                    if not probe_retry:
+                        explore_steps += 1
                     observation = self._explore(
                         snippet, work_dir, accepted_dir if have_accepted else self.out_dir
                     )
@@ -723,6 +762,22 @@ class AgentSolver:
                         else snippet[:EXPLORE_SOURCE_CHARS] + "\n# [source excerpt truncated]"
                     )
                     exploration_log.append((source, observation))
+                    crashed = bool(re.search(r"^\[exit (?!0\])", observation, re.M))
+                    assertion_failure = bool(
+                        re.search(r"^AssertionError(?:\s*:|$)", observation, re.M)
+                    )
+                    if (
+                        GUARDRAILS
+                        and crashed
+                        and not assertion_failure
+                        and not probe_retry_used
+                        and self._can_afford(2, EXPLORE_TIMEOUT_SEC)
+                    ):
+                        probe_retry_used = True
+                        probe_retry = (source, observation)
+                        logger.warning("Probe crashed; requesting one diagnostic recovery")
+                    else:
+                        probe_retry = None
                     while (
                         len(exploration_log) > 1
                         and sum(len(a) + len(b) for a, b in exploration_log) > EXPLORE_LOG_CHARS
@@ -743,10 +798,31 @@ class AgentSolver:
                     prompt_variants = [base + evidence for base in base_variants]
                     initial_prompt = prompt_variants[variant_index]
                     user_prompt = initial_prompt + suffix
+                    if GUARDRAILS and pending_phase == "review" and self._probe_failures:
+                        # An audited assertion/FAIL from an actual output read is executed
+                        # evidence. Repair immediately rather than letting a prose PASS erase it.
+                        failed_output_probe = snippet
+                        accepted_problems = list(self._probe_failures)
+                        guard_repairs += 1
+                        reviewing = False
+                        edit_base = reviewed_code
+                        last_failed_code = reviewed_code
+                        last_feedback = "\n".join(self._probe_failures)
+                        user_prompt = build_repair_prompt(
+                            edit_mode=_edit_mode(reviewed_code),
+                            task_prompt=initial_prompt,
+                            previous_code=reviewed_code,
+                            error_message=last_feedback,
+                            out_dir=str(self.out_dir),
+                            headline="The executed numerical probe "
+                            "read your deliverables and found the failures below. Fix the "
+                            "solution; the same probe will run again after the repair.",
+                        )
                     continue
                 if explicit_probe or (explore and not code):
                     if explicit_probe:
                         explore_steps += 1
+                    probe_retry = None
                     user_prompt = (
                         f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
                         "The probe was NOT executed: no tool allowance or follow-up budget "
@@ -756,12 +832,28 @@ class AgentSolver:
                 if edit_base:
                     edited, unmatched = apply_edits(edit_base, result.content)
                     if edited is not None:
+                        edit_failures = 0
                         logger.info(
                             "Applied edit blocks to the %d-line script", len(edit_base.splitlines())
                         )
                         code = edited
                     elif unmatched and not code:
+                        edit_failures += 1
                         logger.warning("Edit blocks did not match the script: %s", unmatched[:3])
+                        if GUARDRAILS and edit_failures >= 2:
+                            edit_failures = 0
+                            user_prompt = build_repair_prompt(
+                                task_prompt=initial_prompt,
+                                previous_code=edit_base,
+                                error_message="Two edit responses could not be applied: "
+                                + "; ".join(unmatched[:5]),
+                                out_dir=str(self.out_dir),
+                                edit_mode=False,
+                                headline="Rewrite the complete compact script: repeated SEARCH/REPLACE "
+                                "repairs did not match. Preserve every requested output and fix the "
+                                "original failure recorded below.\n" + last_feedback,
+                            )
+                            continue
                         user_prompt = (
                             f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}Your edit "
                             "blocks could not be applied (no edit was made). Resend ALL edits, "
@@ -961,12 +1053,64 @@ class AgentSolver:
                     continue
 
                 if exec_result.success and deliverables_ok:
-                    snapshot_outputs(self.out_dir, accepted_dir)
-                    have_accepted = True
-                    accepted_seconds = exec_result.duration
-                    accepted_turn = attempt
-                    reviewed_code = code
+                    guard_problems = (
+                        self.guardrails.findings(self.out_dir) if self.guardrails else []
+                    )
+                    if (
+                        failed_output_probe
+                        and not guard_problems
+                        and self._can_afford(1, EXPLORE_TIMEOUT_SEC)
+                    ):
+                        observation = self._explore(failed_output_probe, work_dir, self.out_dir)
+                        guard_problems.extend(self._probe_failures)
+                        if self._probe_failures:
+                            logger.warning(
+                                "Output probe still fails after repair: %s", observation[-1000:]
+                            )
+                    # Keep a mechanically valid version across a regressing rewrite. If no
+                    # valid version exists, retain the version with fewer contract violations.
+                    keep_current = (
+                        not have_accepted
+                        or not guard_problems
+                        or len(guard_problems) < len(accepted_problems)
+                    )
+                    if keep_current:
+                        snapshot_outputs(self.out_dir, accepted_dir)
+                        have_accepted = True
+                        accepted_seconds = exec_result.duration
+                        accepted_turn = attempt
+                        reviewed_code = code
+                        accepted_problems = guard_problems
+                    elif guard_problems:
+                        restore_outputs(accepted_dir, self.out_dir)
                     last_error = ""
+                    if guard_problems:
+                        logger.warning("Output contract failed: %s", guard_problems[:4])
+                        if guard_repairs < MAX_GUARD_REPAIRS and self._can_afford(
+                            1, exec_result.duration
+                        ):
+                            guard_repairs += 1
+                            continuations = 0
+                            edit_base = code
+                            last_failed_code = code
+                            last_feedback = "\n".join(guard_problems)
+                            user_prompt = build_repair_prompt(
+                                edit_mode=_edit_mode(code),
+                                task_prompt=initial_prompt,
+                                previous_code=code,
+                                error_message=last_feedback,
+                                out_dir=str(self.out_dir),
+                                headline="Executed output checks found "
+                                "contract violations. Repair these measured failures and retain "
+                                "the other requested computations.",
+                            )
+                            continue
+                        restore_outputs(accepted_dir, self.out_dir)
+                        return self._accept(
+                            attempt,
+                            "retained best outputs after bounded contract repairs",
+                            reviewed_code,
+                        )
                     problems = spec_problems(self.spec, self.out_dir) if self.spec else []
                     if problems and spec_repairs < MAX_SPEC_REPAIRS and self._requests_left() >= 2:
                         # Clean run, but required columns/keys are missing: a precise repair turn
@@ -1184,6 +1328,13 @@ class AgentSolver:
         OUTPUT_DIR points at a fresh copy, so a probe can inspect the latest results
         without changing deliverables. Its exit status and errors are observations.
         """
+        self._probe_failures = []
+        if GUARDRAILS:
+            blocking, advisory = preflight(snippet, self.task_dir)
+            if blocking:
+                return "[exit 1]\n[stderr]\nProbe static check failed:\n" + "\n".join(
+                    blocking + advisory
+                )
         timeout = self._execution_timeout(EXPLORE_TIMEOUT_SEC, reserve=60)
         if timeout is None:
             return "(exploration skipped: insufficient time left)"
@@ -1193,13 +1344,15 @@ class AgentSolver:
         if timeout is None:
             return "(exploration skipped: insufficient time left after copying outputs)"
         run = run_code(
-            snippet,
+            audited_tests(snippet) if GUARDRAILS else snippet,
             work_dir / "explore",
             probe_outputs,
             task_dir=self.task_dir,
             timeout_sec=timeout,
         )
         status = f"[exit {run.returncode}]" + (" [timed out]" if run.timed_out else "")
+        if GUARDRAILS:
+            self._probe_failures = test_evidence(run).failures
         text = run.feedback.strip() or "(no output)"
         logger.info("Probe execution: %s, %.2fs", status, run.duration)
         return status + "\n" + text[-EXPLORE_OUTPUT_CHARS:]
@@ -1425,6 +1578,7 @@ class AgentSolver:
         )
         child.deadline, child.time_budget = self.deadline, self.time_budget
         child.spec, child.canaries = self.spec, self.canaries
+        child.guardrails = self.guardrails
         child._prompt_parts = self._prompt_parts
         child.stop_event = self.stop_event
         return child

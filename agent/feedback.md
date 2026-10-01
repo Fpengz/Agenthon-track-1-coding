@@ -11,14 +11,18 @@ flowchart TD
     B -->|yes| M[House probe role: Python program]
     M --> P[Execute local probe in scratch output copy]
     P --> O[Record stdout, errors and output version]
-    O --> A
+    O --> H{Audited output assertion or FAIL?}
+    H -->|yes, safeguards on| F
+    H -->|no| A
     B -->|no| G[House solution or review role]
     G --> Q{Reply type}
     Q -->|optional explore block| P
     Q -->|solution or repair script| E[Execute solution]
     E -->|failure| F[Previous code, exception and retained observations]
     F --> A
-    E -->|clean outputs| S[Snapshot outputs]
+    E -->|clean outputs| C{Output contracts pass?}
+    C -->|no, safeguards on| F
+    C -->|yes or safeguards off| S[Snapshot outputs]
     S --> A
     Q -->|review defects without code| A
     Q -->|complete review PASS| D[Final deliverables]
@@ -90,3 +94,27 @@ executed across the 16 probe-arm units. The system's Python-only response instru
 with the user prompt's initial `explore` format. This pilot does not establish whether correctly
 routed initial numerical probes help. The explicit request phase and separate role prompts above
 fix that conflict; repeat the same matched pilot to measure the corrected loop.
+
+The repeated pilot (`20261001-1151-probe-routing-*`) executed 29 probes, eight of which crashed.
+It passed 4/16 probe-arm units vs 5/16 control. Working probes frequently checked an aggregation
+or an already-correct subcalculation while a different required stage remained wrong.
+
+## General safeguards
+
+`AGENT_GUARDRAILS=1` adds contracts from the runtime instruction and compact domain identities.
+JSON objects/arrays and nested numeric fields, exact key/column names, and explicit upper-tail
+loss and quote-order identities are checked after each clean execution. Concrete violations
+start repair before model approval. Keep the snapshot with fewer mechanical failures; a rewrite
+with failures cannot replace one with none. The final budget fallback remains a best-effort
+submission, not a claim of numerical correctness.
+
+Probe selection covers source calculations, units and edge cases. A probe that crashes gets one
+recovery, charged to the normal request/deadline budget. Read auditing separates an assertion
+about actual deliverables from an input-only hypothesis. An audited output failure starts repair
+directly and freezes that probe for re-execution after fixes. Repeated SEARCH/REPLACE failures
+switch to a complete compact rewrite instead of repeatedly requesting the same unmatched edits.
+
+Synthetic loop regressions reproduce approval despite schema failures, losing valid outputs to
+a NaN rewrite, skipping crashed probes, and failing to recheck numerical repairs. Parser tests
+cover dynamic JSON keys, nested array types, shifted loss distributions and documented column
+formats. The audit of past checker-passed outputs must produce no false flags before a kept run.

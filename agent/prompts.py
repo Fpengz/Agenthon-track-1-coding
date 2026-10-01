@@ -145,6 +145,7 @@ def build_initial_prompt(
     requirements_checklist: str = "",
     skills_summary: str = "",
     explore_steps: int = 0,
+    validation_guidance: str = "",
 ) -> str:
     """Format the initial prompt for the coding agent (the task prompt reused by every turn)."""
     notes_str = (
@@ -185,7 +186,7 @@ def build_initial_prompt(
 1. Write a complete, standalone Python script that reads inputs from TASK_DIR and writes the required deliverables to OUTPUT_DIR.
 2. Ensure all column names, file formats, and data structures match the specification exactly.
 3. Keep reasoning brief, then enclose your complete script inside one ```python ... ``` code block.
-{STRUCTURE_INSTRUCTION if structured else ""}{EXPLORE_INSTRUCTION.format(k=explore_steps) if explore_steps else ""}{f"{chr(10)}{skills_summary}{chr(10)}" if skills_summary else ""}"""
+{STRUCTURE_INSTRUCTION if structured else ""}{EXPLORE_INSTRUCTION.format(k=explore_steps) if explore_steps else ""}{f"{chr(10)}{skills_summary}{chr(10)}" if skills_summary else ""}{f"{chr(10)}{validation_guidance}{chr(10)}" if validation_guidance else ""}"""
 
 
 def build_repair_prompt(

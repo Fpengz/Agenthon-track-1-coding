@@ -35,7 +35,7 @@ class DeliverableSpec:
     row_count: int | None = None  # an exact "N rows" statement
 
 
-def _section(instruction: str, name: str) -> str:
+def deliverable_section(instruction: str, name: str) -> str:
     """Text describing ``name``: from its first heading (or bold) mention to the next heading."""
     for heading in _HEADING.finditer(instruction):
         if name in heading.group(2):
@@ -136,7 +136,10 @@ def _table_columns(section: str) -> list[str]:
                     break
                 first = row.strip().strip("|").split("|")[0]
                 found = _BACKTICKED.findall(first) or [first.strip()]
-                names.extend(n.strip() for n in found if n.strip())
+                # One row describes one column. Later backticks in the same cell can
+                # describe its date format or allowed values, not additional columns.
+                if found and found[0].strip():
+                    names.append(found[0].strip())
             if names:
                 return names
     # "Columns: `a, b, c`" or "Columns: `a`, `b`"
@@ -145,6 +148,7 @@ def _table_columns(section: str) -> list[str]:
         # The list ends with its sentence ("... `bic`. One row per pair ..."): later backticked
         # words on the line are values or other fields, not columns.
         listed = re.split(r"(?<=[`\w)])\.\s", match.group(1), maxsplit=1)[0]
+        listed = re.sub(r"\([^()]*\)", "", listed)
         ticked = _BACKTICKED.findall(listed)
         parts = ticked[0].split(",") if len(ticked) == 1 else ticked
         names = [p.strip() for p in parts if re.fullmatch(r"[\w.\- ]+", p.strip() or "#")]
@@ -191,7 +195,7 @@ def _json_keys(section: str) -> list[str]:
 def parse_spec(instruction: str, deliverables: list[str]) -> list[DeliverableSpec]:
     specs = []
     for name in deliverables:
-        section = _section(instruction, name)
+        section = deliverable_section(instruction, name)
         if not section:
             continue
         suffix = pathlib.Path(name).suffix.lower()

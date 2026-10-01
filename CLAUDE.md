@@ -165,7 +165,23 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   Python replies route to the scratch runner, and the pending generation/review resumes with
   observations. Ordinary requests also allow explicit `explore` blocks without a conflicting
   Python-only system rule. Incomplete dedicated probes get one recovery, then resume the pending
-  operation. Control prompts remain unchanged. Repeat the matched pilot with this routing.
+  operation. Control prompts remain unchanged. The corrected pilot (`20261001-1151-probe-routing-*`,
+  image `1567ab0`) passed 1/3 probes vs 2/3 control (mean 0.250 vs 0.313), with 10.13 vs
+  7.75 requests and 311 vs 266 s/unit. All 29 probes routed correctly; eight crashed, and
+  successful probes often measured an already-correct subcalculation. Keep exploration off.
+- General safeguards (`AGENT_GUARDRAILS=1`, default off, matched pilot pending):
+  instruction-derived JSON container shapes, nested numeric fields, existing column/key/row
+  contracts, and explicit upper-tail loss ES>=VaR/positive-loss and FX bid<=ask identities.
+  Clear violations trigger up to three repairs before a prose review can accept them. A valid
+  snapshot survives a mechanically invalid rewrite; otherwise retain the version with fewer
+  contract findings. Domain guidance selects units, sign, index alignment, limiting-case and
+  hedge checks by specification concepts, without unit IDs or stored expected results.
+  With exploration enabled, crashed probes get one recovery; assertions/FAIL lines from audited
+  deliverable reads trigger solution repair directly, and the same failed probe runs after fixes.
+  Input-only assertions remain observations. Two unmatched edit replies switch to a compact
+  full rewrite. The parser skips parenthesized date formats and allowed values in column lists.
+  Synthetic regressions pass; a historical audit flagged 0/1,138 checker-passed outputs across
+  49 units after correcting the column parser. Repeat that audit before keeping stricter checks.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output

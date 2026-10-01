@@ -43,7 +43,16 @@ class RecordedClient:
 
 @pytest.fixture(autouse=True)
 def default_policy(monkeypatch):
-    for name in ("VERIFY", "TESTS", "PLAN", "SKILLS", "ADAPTIVE", "SPEC_CHECKS", "EXAMPLES"):
+    for name in (
+        "VERIFY",
+        "TESTS",
+        "PLAN",
+        "SKILLS",
+        "ADAPTIVE",
+        "SPEC_CHECKS",
+        "EXAMPLES",
+        "GUARDRAILS",
+    ):
         monkeypatch.setattr(loop, name, False)
     monkeypatch.setattr(loop, "CANDIDATES", 1)
     monkeypatch.setattr(loop, "EXPLORE_STEPS", 0)
@@ -58,6 +67,137 @@ def solver_for(tmp_path, client):
 
 def price(tmp_path):
     return json.loads((tmp_path / "out" / "r.json").read_text())["price"]
+
+
+def test_guardrails_repair_schema_despite_a_model_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True, raising=False)
+    client = RecordedClient(writer(1), "VERDICT: PASS", writer(2.5), "VERDICT: PASS")
+    solver = solver_for(tmp_path, client)
+    (solver.task_dir / "instruction.md").write_text(
+        'Write /output/r.json.\n### r.json\n```json\n{"bond_A": {"units": <float>}}\n```'
+    )
+
+    def output(data):
+        return "```python\nimport os, pathlib\n" + (
+            "(pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').write_text("
+            + repr(json.dumps(data))
+            + ")\n```"
+        )
+
+    client.responses[0] = output({"A": {"units": 1}})
+    client.responses[2] = output({"bond_A": {"units": 2.5}})
+    assert solver.run()
+    assert "bond_A" in json.loads((solver.out_dir / "r.json").read_text())
+    assert client.requests[1][1]["phase"] == "repair"
+    assert "bond_A" in client.requests[1][0]
+
+
+def test_guardrails_preserve_valid_outputs_after_a_bad_review_fix(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True, raising=False)
+    client = RecordedClient(writer(2.5), "VERDICT: FAIL\n" + writer("NaN"))
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 1
+    (solver.task_dir / "instruction.md").write_text(
+        'Write /output/r.json.\n### r.json\n```json\n{"price": <float>}\n```'
+    )
+    assert solver.run()
+    assert price(tmp_path) == 2.5
+
+
+def test_guardrails_recover_crashed_probe_before_resuming_solution(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True, raising=False)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    client = RecordedClient(
+        "```python\nraise NameError('measurement_missing_import')\n```",
+        "```python\nprint('measured_tail_mean=2.5')\n```",
+        writer(2.5),
+        "VERDICT: PASS",
+    )
+    assert solver_for(tmp_path, client).run()
+    assert [kwargs["phase"] for _, kwargs in client.requests] == [
+        "probe",
+        "probe",
+        "generate",
+        "review",
+    ]
+    assert "measurement_missing_import" in client.requests[1][0]
+    assert "measured_tail_mean=2.5" in client.requests[2][0]
+
+
+def test_guardrails_repair_audited_probe_failure_and_recheck(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    client = RecordedClient(
+        "```python\nprint('toy_price=2.5')\n```",
+        writer(1.5),
+        PRICE_TEST,
+        writer(2.5),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert price(tmp_path) == 2.5
+    assert [kwargs["phase"] for _, kwargs in client.requests] == [
+        "probe",
+        "generate",
+        "probe",
+        "repair",
+        "review",
+    ]
+    assert "price expected 2.5 got 1.5" in client.requests[3][0]
+
+
+def test_guardrails_probe_recovery_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    bad = "```python\nraise NameError('broken_probe')\n```"
+    client = RecordedClient(bad, bad, writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert [k["phase"] for _, k in client.requests] == ["probe", "probe", "generate", "review"]
+
+
+def test_guardrails_unmatched_edits_switch_to_a_complete_rewrite(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True)
+    bad = "```python\n" + "# line\n" * 80 + "raise ValueError('original_error')\n```"
+    edits = "<<<<<<< SEARCH\nnot_in_the_script\n=======\nfixed\n>>>>>>> REPLACE"
+    client = RecordedClient(bad, edits, edits, writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    prompt = client.requests[3][0]
+    assert "Rewrite the complete compact script" in prompt
+    assert "original_error" in prompt
+    assert "entire corrected Python script" in prompt
+
+
+def test_guardrails_input_only_assertion_cannot_reject_a_solution(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    client = RecordedClient(
+        "```python\nprint('toy_price=2.5')\n```",
+        writer(2.5),
+        "```python\nassert False, 'input_only_hypothesis'\n```",
+        "VERDICT: PASS",
+    )
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.requests[-1][1]["phase"] == "review"
+
+
+def test_guardrails_failed_output_probe_runs_again_after_an_inadequate_fix(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "GUARDRAILS", True)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    client = RecordedClient(
+        "```python\nprint('toy_price=2.5')\n```",
+        writer(1.5),
+        PRICE_TEST,
+        writer(1.7),
+        writer(2.5),
+        "VERDICT: PASS",
+    )
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert "price expected 2.5 got 1.7" in client.requests[4][0]
+    assert client.requests[4][1]["phase"] == "repair"
 
 
 def test_initial_python_probe_is_not_a_solution_attempt(tmp_path, monkeypatch):
