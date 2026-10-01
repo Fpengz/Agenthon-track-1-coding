@@ -148,7 +148,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   contains the original specification and input information, never the solution or output
   previews. A complete suite is frozen and re-executed on fresh output copies after each clean
   run; executed assertions or FAIL lines can drive up to two repairs. Incomplete/truncated suites
-  or test-program crashes fall back to normal review. The solution can reject a faulty test by
+  or test-program crashes fall back to normal review. An execution audit requires a suite to
+  actually open deliverables for reading; input-only checks supply no output evidence.
+  The solution can reject a faulty test by
   returning its script unchanged. Generation is capped at 120 s; tests are not used with
   consensus candidates. Record and forward this switch in all experiment/container runs.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency

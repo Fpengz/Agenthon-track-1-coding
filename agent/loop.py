@@ -56,6 +56,7 @@ from agent.review import (
 )
 from agent.skills import skills_summary
 from agent.spec import DeliverableSpec, parse_spec, spec_problems
+from agent.spec_tests import audited_tests, test_evidence
 
 logger = logging.getLogger(__name__)
 NO_CODE_MARKER = "\n\n### NOTE:\n"
@@ -1118,13 +1119,13 @@ class AgentSolver:
             shutil.rmtree(copy_dir)
         shutil.copytree(accepted_dir, copy_dir)
         run = run_code(
-            code,
+            audited_tests(code),
             work_dir / "spec-tests",
             copy_dir,
             task_dir=self.task_dir,
             timeout_sec=timeout,
         )
-        evidence = verifier_result(run)
+        evidence = test_evidence(run)
         logger.info(
             "Spec-first tests: %d PASS, %d FAIL (returncode=%d)",
             evidence.passes,

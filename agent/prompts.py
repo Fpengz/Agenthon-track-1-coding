@@ -396,18 +396,24 @@ def build_spec_tests_prompt(task_prompt: str) -> str:
     return f"""{task_prompt}
 
 ---
+You are writing tests for DELIVERABLES that another program will produce.
+The test program must READ those deliverables and compare their values with independent
+calculations. Checking the supplied inputs alone cannot establish whether the solution works.
+
 Your role for this request is TEST AUTHOR. Another request independently writes the solution.
 Write a standalone Python test program derived ONLY from the TASK SPECIFICATION and supplied
 input information above. The solution and its outputs are unavailable to you.
 
 ### SPEC-FIRST TEST REQUIREMENTS:
-1. Read the original inputs from TASK_DIR and future deliverables from OUTPUT_DIR, using the
-   environment variables. Resolve the input paths using the mapping above. Treat all files as
-   read-only. Return tests, rather than a program that writes deliverables.
+1. Start by setting out = pathlib.Path(os.environ["OUTPUT_DIR"]) and loading the required
+   deliverable files from out. These files will exist when your tests execute. Read original
+   inputs from TASK_DIR as needed for independent expected values, using the mapping above.
+   Treat all files as read-only. Return tests, rather than a program that writes deliverables.
 2. Independently compute 2-4 representative numerical results from the supplied input files.
    Use the specification's exact formulas, filters, timing, units and conventions. Check values
-   by their stated row identifiers or keys. Prefer small direct calculations over implementing
-   the entire solution. If agent_skills helpers are listed, use them where conventions match.
+   against the LOADED DELIVERABLE values by their stated row identifiers or keys. Prefer small
+   direct calculations over implementing the entire solution. If agent_skills helpers are
+   listed, use them where conventions match.
 3. Also check explicitly required schema and financial invariants. Test only requirements the
    specification establishes. Where a numerical convention is ambiguous, test a stated
    invariant instead of inventing an exact expected value. Use sensible numerical tolerances;

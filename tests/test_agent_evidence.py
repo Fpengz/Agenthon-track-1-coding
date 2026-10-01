@@ -139,12 +139,39 @@ def test_spec_first_tests_cannot_corrupt_the_deliverables(tmp_path, monkeypatch)
 
 def test_solution_can_reject_an_incorrect_spec_first_test(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "TESTS", True)
-    client = SpecTestClient(
-        "```python\nassert False, 'bad assumption'\n```", writer(2.5), writer(2.5)
+    bad_test = (
+        "```python\nimport os, pathlib\n"
+        "(pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').read_text()\n"
+        "assert False, 'bad assumption'\n```"
     )
+    client = SpecTestClient(bad_test, writer(2.5), writer(2.5))
     assert solver_for(tmp_path, client).run()
     assert price(tmp_path) == 2.5
     assert client.request_count == 3
+
+
+@pytest.mark.parametrize("reported", ["print('PASS: inputs')", "assert False, 'wrong input'"])
+def test_input_only_suites_cannot_produce_output_evidence(tmp_path, monkeypatch, reported):
+    monkeypatch.setattr(loop, "TESTS", True)
+    suite = f"```python\nimport os\nunused = os.environ['OUTPUT_DIR']\n{reported}\n```"
+    client = SpecTestClient(suite, writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.request_count == 3
+    assert not any(kwargs["phase"] == "repair" for _, kwargs in client.requests)
+
+
+def test_spec_first_suite_preserves_future_imports_and_reads_binary_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "TESTS", True)
+    suite = (
+        "```python\nfrom __future__ import annotations\nimport os, pathlib\n"
+        "actual = (pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').read_bytes()\n"
+        "assert b'2.5' in actual, 'wrong price'\nprint('PASS: price')\n```"
+    )
+    client = SpecTestClient(suite, writer(1.5), writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.request_count == 4
 
 
 def test_spec_first_test_repairs_are_bounded(tmp_path, monkeypatch):
