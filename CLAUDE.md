@@ -182,6 +182,10 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   full rewrite. The parser skips parenthesized date formats and allowed values in column lists.
   Synthetic regressions pass; a historical audit flagged 0/1,138 checker-passed outputs across
   49 units after correcting the column parser. Repeat that audit before keeping stricter checks.
+  The first six-run pilot (`20261001-1533-guardrails-*`) got connection refusals on all 48
+  units and zero model replies. Its failed executions remain recorded; they provide no evidence
+  about safeguard effectiveness. A fresh matched retry waits for the configured endpoint's
+  model listing to respond before starting any unit.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
