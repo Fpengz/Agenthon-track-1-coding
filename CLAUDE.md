@@ -169,7 +169,7 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   image `1567ab0`) passed 1/3 probes vs 2/3 control (mean 0.250 vs 0.313), with 10.13 vs
   7.75 requests and 311 vs 266 s/unit. All 29 probes routed correctly; eight crashed, and
   successful probes often measured an already-correct subcalculation. Keep exploration off.
-- General safeguards (`AGENT_GUARDRAILS=1`, default off, matched pilot pending):
+- General safeguards (`AGENT_GUARDRAILS=1`, default off, full-roster confirmation pending):
   instruction-derived JSON container shapes, nested numeric fields, existing column/key/row
   contracts, and explicit upper-tail loss ES>=VaR/positive-loss and FX bid<=ask identities.
   Clear violations trigger up to three repairs before a prose review can accept them. A valid
@@ -184,8 +184,12 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   49 units after correcting the column parser. Repeat that audit before keeping stricter checks.
   The first six-run pilot (`20261001-1533-guardrails-*`) got connection refusals on all 48
   units and zero model replies. Its failed executions remain recorded; they provide no evidence
-  about safeguard effectiveness. A fresh matched retry waits for the configured endpoint's
-  model listing to respond before starting any unit.
+  about safeguard effectiveness. The matched retry (`20261001-1650-guardrails2-*`, same image,
+  two runs per arm at `-j 2`, all six simultaneous, 1000 s budget) passed 2/3 control,
+  5/3 safeguards, and 4/3 safeguards plus probes on eight units. Mean pass@1 was 0.313,
+  0.500, and 0.438; requests/unit were 5.69, 7.75, and 9.06; seconds/unit were 336, 438,
+  and 432. This small pilot supports full-roster confirmation of safeguards alone; it does
+  not establish a roster gain or justify adding probes. Keep defaults unchanged.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
