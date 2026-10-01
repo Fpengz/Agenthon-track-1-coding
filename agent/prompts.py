@@ -94,6 +94,20 @@ PROBE_SYSTEM_PROMPT = _system_prompt(
 """,
 )
 
+AUDIT_SYSTEM_PROMPT = _system_prompt(
+    "Write executable numerical comparisons derived from the task specification and inputs. "
+    "The program checks existing deliverables; it does not solve or rewrite the task.",
+    "   - Read deliverables from the scratch copy in OUTPUT_DIR and inputs from TASK_DIR. "
+    "Report comparisons to stdout. Keep all files unchanged.",
+    """5. Audit Budget and Formatting:
+   - Return one complete runnable Python block, with nothing after its closing fence.
+   - Keep the audit under 100 lines and the whole response under 4,000 tokens.
+   - Recompute 2-4 numerical requirements independently from the inputs, then read and compare
+     actual outputs. Print PASS: or FAIL: with values and the justified numerical tolerance.
+   - Use installed libraries and ASCII code. Print SKIP: for checks lacking a justified oracle.
+""",
+)
+
 
 _MAX_PATH_MAP_LINES = 40
 
@@ -270,6 +284,41 @@ below; its last line is complete.
 
 Continue the script from the next line. Output ONLY the remaining code in one ```python ... ```
 block: do not repeat any line shown above and do not restart the script. Keep the rest compact.
+"""
+
+
+def build_compact_rewrite_prompt(task_prompt: str, feedback: str) -> str:
+    return f"""{task_prompt}
+
+### COMPACT RECOVERY:
+The previous approach exhausted its continuation/edit budget. Write the complete compact
+solution in one Python block, covering EVERY required deliverable. Reuse arrays and helper
+functions; omit commentary, docstrings and duplicated computations. Aim for at most 160 lines.
+Do not omit requested calculations to meet that target. Diagnose the recorded failure and
+change the failing approach. Do not return SEARCH/REPLACE blocks.
+
+### RECORDED FAILURE:
+{feedback or "The response exceeded the output cap before completing the solution."}
+"""
+
+
+def build_numerical_audit_prompt(task_prompt: str, filenames: list[str]) -> str:
+    return f"""{task_prompt}
+
+### INDEPENDENT NUMERICAL AUDIT:
+Write a compact executable test program from the specification and input data. The solution
+code is intentionally absent. Actual deliverables are available to READ in OUTPUT_DIR:
+{", ".join(filenames)}
+
+Select 2-4 high-risk numerical requirements across different requested stages. Derive expected
+values independently from TASK_DIR inputs BEFORE comparing with saved outputs. Check units,
+signs, date/index alignment and a relevant limiting case. Check source computations, not just
+whether an aggregate matches its own source column. Use the specification's exact conventions.
+Read the actual output files; never substitute an output preview or an invented constant.
+Print PASS: or FAIL: per check, with computed value, actual value, discrepancy and justified
+tolerance. Exit 1 for measured discrepancies, 0 otherwise. Do not modify deliverables, round
+away discrepancies, or assert guessed conventions. If a requirement cannot be independently
+checked, print SKIP: with its reason. Keep the entire audit in one closed Python block.
 """
 
 

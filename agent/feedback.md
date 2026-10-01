@@ -118,3 +118,39 @@ Synthetic loop regressions reproduce approval despite schema failures, losing va
 a NaN rewrite, skipping crashed probes, and failing to recheck numerical repairs. Parser tests
 cover dynamic JSON keys, nested array types, shifted loss distributions and documented column
 formats. The audit of past checker-passed outputs must produce no false flags before a kept run.
+
+## Repair v2
+
+`AGENT_REPAIR_V2=1` is an experimental response to three trace patterns: token-limited scripts,
+ineffective edits and clean executions with incorrect numbers. It leaves the default policy
+unchanged while an immutable-image comparison runs.
+
+An edit response is one transaction: every SEARCH block must close, and a truncated response
+applies no blocks. A complete Python prefix in a truncated response is also rejected. After two
+continuations, two unmatched edit replies, unchanged failing code or a repeated execution
+exception, the next request asks for a complete compact rewrite with reasoning disabled.
+Static-check messages, missing deliverables and the execution exception remain in that prompt.
+
+After a clean execution, a separate audit request receives the specification, input information
+and output filenames. It receives neither solution code nor output values. It recomputes 2-4
+numerical requirements from inputs, then reads actual outputs to compare values, conventions
+and limiting cases with stated tolerances. Read auditing filters input-only claims. Complete
+audits are frozen and rerun on fresh output copies after rewrites; failed assertions and FAIL
+lines start bounded repairs. A passing snapshot survives a later measured regression. A crashed,
+silent or truncated audit gets one recovery and then falls back to ordinary review. Audit checks
+can still be incomplete or use mistaken assumptions; this is a testable proposal, not evidence
+that numerical accuracy improved.
+
+The recorded-client regressions execute real Python and cover atomic edits (5/7/9-character
+markers, including malformed responses labelled complete), continuation exhaustion, repeated
+exceptions, lost static feedback, numerical repair/recheck, input-only audits, truncated audits
+and retaining audited-valid outputs:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_agent_evidence.py -k repair_v2
+```
+
+Compare safeguards with repair v2 off/on, two repeats each over the same eight diagnostic units,
+using one pinned image and eight total simultaneous jobs. Queue this pilot after the existing
+full-roster cohort finishes. Report fixed-denominator passes, model requests, runtime,
+truncations, no-progress repairs and actual numerical audit executions before promotion.

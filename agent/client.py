@@ -169,8 +169,8 @@ class HouseModelClient:
     ) -> ChatResult:
         """Send a completion request, retrying transient failures within the request budget.
 
-        ``phase`` (generate / repair / review / continue / probe / judge / verify / tests / plan) selects the
-        reasoning effort in hybrid mode.
+        ``phase`` selects reasoning effort: hybrid uses thinking only for generation;
+        tests, audit and compact recovery reserve low-mode replies for executable code.
         ``deadline`` is an absolute ``time.monotonic()`` limit shared by a unit's requests.
         """
         for retry in range(TRANSIENT_RETRIES + 1):
@@ -302,7 +302,7 @@ class HouseModelClient:
     def _mode_for(self, phase: str) -> str:
         # Independent tests need their token cap for executable comparisons. Keep the low
         # generation policy, but avoid spending the test request on inline reasoning.
-        if phase == "tests" and self.reasoning_mode == "low":
+        if phase in {"tests", "audit", "compact"} and self.reasoning_mode == "low":
             return "off"
         if self.reasoning_mode != HYBRID:
             return self.reasoning_mode

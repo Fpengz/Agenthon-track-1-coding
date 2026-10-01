@@ -49,10 +49,11 @@ def fake_house(monkeypatch):
 MESSAGES = [{"role": "user", "content": "Solve the task"}]
 
 
-def test_spec_first_tests_reserve_the_reply_for_code_without_changing_generation(fake_house):
+@pytest.mark.parametrize("phase", ["tests", "audit", "compact"])
+def test_code_phases_reserve_reply_without_changing_generation(fake_house, phase):
     client, _, _, calls = fake_house
     client.reasoning_mode = "low"
-    client.chat(MESSAGES, phase="tests")
+    client.chat(MESSAGES, phase=phase)
     client.chat(MESSAGES, phase="generate")
     assert calls[0]["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert calls[1]["extra_body"]["chat_template_kwargs"] == {"low_effort": True}

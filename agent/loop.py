@@ -20,9 +20,11 @@ from agent.consensus import compare_outputs
 from agent.context import canary_leaks, card_facts, sanitize_instruction, task_canaries
 from agent.examples import format_example, select_example
 from agent.executor import (
+    EDIT_START,
     apply_edits,
     extract_partial_code,
     extract_python_code,
+    incomplete_edit_batch,
     join_continuation,
     run_code,
     strip_reasoning,
@@ -32,15 +34,18 @@ from agent.inputs import build_input_previews
 from agent.knowledge import domain_notes, read_card
 from agent.preflight import preflight
 from agent.prompts import (
+    AUDIT_SYSTEM_PROMPT,
     PROBE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     TOOL_SYSTEM_PROMPT,
     VERIFY_REPAIR_HEADLINE,
+    build_compact_rewrite_prompt,
     build_continuation_prompt,
     build_exploration_section,
     build_initial_prompt,
     build_judge_prompt,
     build_no_code_prompt,
+    build_numerical_audit_prompt,
     build_plan_prompt,
     build_probe_instruction,
     build_probe_request,
@@ -105,6 +110,7 @@ EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true"
 # requirements checklist extracted up front. Both spend otherwise-unused requests on evidence
 # about correctness: 115 of 136 failing units ended "accepted but wrong".
 VERIFY = os.environ.get("AGENT_VERIFY", "0").strip().lower() in {"1", "true", "on"}
+REPAIR_V2 = os.environ.get("AGENT_REPAIR_V2", "0").strip().lower() in {"1", "true", "on"}
 # One independent test-writing request, overlapped with generation. The suite is frozen before
 # it sees any outputs and re-executed after repairs; unlike VERIFY, it never reads the solution.
 TESTS = os.environ.get("AGENT_TESTS", "0").strip().lower() in {"1", "true", "on"}
@@ -557,6 +563,8 @@ class AgentSolver:
         last_feedback = ""
         edit_base = ""  # the script shown in the pending repair/review prompt (edits apply to it)
         edit_failures = 0
+        compact_mode = False
+        frozen_audit = ""
         spec_repairs = 0
         guard_repairs = 0
         accepted_problems: list[str] = []
@@ -612,6 +620,8 @@ class AgentSolver:
                         )
                     )
                     phase = "probe" if explicit_probe else pending_phase
+                    if REPAIR_V2 and compact_mode and not explicit_probe:
+                        phase = "compact"
                     system_prompt = (
                         PROBE_SYSTEM_PROMPT
                         if explicit_probe
@@ -619,6 +629,8 @@ class AgentSolver:
                         if EXPLORE_STEPS
                         else SYSTEM_PROMPT
                     )
+                    if REPAIR_V2 and compact_mode and not explicit_probe:
+                        system_prompt += "\nReturn code immediately; spend the response budget on the complete compact script."
                     probe_instruction = (
                         build_probe_request(pending_phase)
                         if explicit_probe
@@ -829,7 +841,37 @@ class AgentSolver:
                         "remains. Finish the pending operation in its requested format."
                     )
                     continue
+                if REPAIR_V2 and result.truncated and code and not EDIT_START.search(answer):
+                    if reviewing:
+                        last_feedback = _review_findings(result.content)
+                    reviewing = False
+                    partial_code = ""
+                    compact_mode = True
+                    user_prompt = build_compact_rewrite_prompt(initial_prompt, last_feedback)
+                    logger.warning(
+                        "Closed prefix of truncated response rejected; requesting compact solution"
+                    )
+                    continue
                 if edit_base:
+                    if REPAIR_V2 and (
+                        (result.truncated and EDIT_START.search(answer))
+                        or incomplete_edit_batch(result.content)
+                    ):
+                        edit_failures += 1
+                        logger.warning("Truncated edit batch rejected atomically; no edits applied")
+                        if edit_failures >= 2:
+                            compact_mode = True
+                            user_prompt = build_compact_rewrite_prompt(
+                                initial_prompt, last_feedback
+                            )
+                        else:
+                            user_prompt = (
+                                user_prompt.split(NO_CODE_MARKER)[0]
+                                + NO_CODE_MARKER
+                                + "Your edit batch was truncated. No edits were applied. Return ALL "
+                                "required edits in complete closed blocks; use short exact SEARCH spans."
+                            )
+                        continue
                     edited, unmatched = apply_edits(edit_base, result.content)
                     if edited is not None:
                         edit_failures = 0
@@ -840,8 +882,14 @@ class AgentSolver:
                     elif unmatched and not code:
                         edit_failures += 1
                         logger.warning("Edit blocks did not match the script: %s", unmatched[:3])
-                        if GUARDRAILS and edit_failures >= 2:
+                        if (GUARDRAILS or REPAIR_V2) and edit_failures >= 2:
                             edit_failures = 0
+                            if REPAIR_V2:
+                                compact_mode = True
+                                user_prompt = build_compact_rewrite_prompt(
+                                    initial_prompt, last_feedback + "\n" + "; ".join(unmatched[:5])
+                                )
+                                continue
                             user_prompt = build_repair_prompt(
                                 task_prompt=initial_prompt,
                                 previous_code=edit_base,
@@ -863,6 +911,8 @@ class AgentSolver:
                 if reviewing:
                     reviewing = False
                     verdict = parse_verdict(result.content)
+                    if REPAIR_V2 and verdict == "FAIL":
+                        last_feedback = _review_findings(result.content)
                     cut_off_fix = result.truncated and bool(extract_partial_code(result.content))
                     logger.info("Review verdict: %s (corrected script: %s)", verdict, bool(code))
                     if verdict == "PASS" and not result.truncated:
@@ -915,6 +965,16 @@ class AgentSolver:
                         continue
                     else:
                         partial_code = ""
+                        if REPAIR_V2:
+                            compact_mode = True
+                            continuations = 0
+                            user_prompt = build_compact_rewrite_prompt(
+                                initial_prompt, last_feedback
+                            )
+                            logger.warning(
+                                "Continuation budget exhausted; switching to compact recovery"
+                            )
+                            continue
                 if not code:
                     logger.warning(
                         "No complete Python code block in response (%d characters, finish_reason=%s)",
@@ -957,6 +1017,11 @@ class AgentSolver:
                         "Model returned the previous failing script unchanged; re-asking"
                     )
                     edit_base = ""
+                    if REPAIR_V2:
+                        compact_mode = True
+                        user_prompt = build_compact_rewrite_prompt(initial_prompt, last_feedback)
+                        temperature = 0.0
+                        continue
                     user_prompt = (
                         f"{initial_prompt}{NO_CODE_MARKER}An earlier script for this task failed "
                         f"repeatedly with this error:\n```\n{last_feedback}\n```\nWrite a new "
@@ -980,6 +1045,10 @@ class AgentSolver:
                     continuations = 0
                     last_failed_code = code
                     edit_base = code
+                    if REPAIR_V2:
+                        last_feedback = "Failure type: static check\n" + "\n".join(
+                            blocking + advisory
+                        )
                     user_prompt = build_repair_prompt(
                         edit_mode=_edit_mode(code),
                         task_prompt=initial_prompt,
@@ -1056,6 +1125,11 @@ class AgentSolver:
                     guard_problems = (
                         self.guardrails.findings(self.out_dir) if self.guardrails else []
                     )
+                    if REPAIR_V2 and frozen_audit:
+                        report = self._run_spec_tests(frozen_audit, work_dir, self.out_dir)
+                        if report:
+                            guard_problems.append(report)
+                            logger.warning("Frozen numerical audit still fails: %s", report[:400])
                     if (
                         failed_output_probe
                         and not guard_problems
@@ -1163,19 +1237,30 @@ class AgentSolver:
                     verify_cap = ADAPTIVE_MAX_VERIFY if ADAPTIVE else MAX_VERIFY
                     verify_affordable = (
                         self._can_afford(3, accepted_seconds)
-                        if ADAPTIVE
+                        if ADAPTIVE or REPAIR_V2
                         else self._requests_left() >= 3 and self._time_left() > 2 * MIN_ATTEMPT_SEC
                     )
-                    if VERIFY and verifies < verify_cap and verify_affordable:
+                    if (
+                        (VERIFY or (REPAIR_V2 and not frozen_audit and attempt < attempts))
+                        and verifies < verify_cap
+                        and verify_affordable
+                    ):
                         verifies += 1
                         report = self._run_verifier(initial_prompt, code, work_dir, accepted_dir)
+                        if REPAIR_V2:
+                            frozen_audit = self._last_numeric_audit
                         if report:
                             logger.warning(
                                 "Verification failed (round %d): %s", verifies, report[:200]
                             )
                             continuations = 0
                             edit_base = code
-                            verify_code = code
+                            if REPAIR_V2:
+                                last_failed_code = code
+                                last_feedback = report
+                                accepted_problems = [report]
+                            else:
+                                verify_code = code
                             user_prompt = build_repair_prompt(
                                 edit_mode=_edit_mode(code),
                                 task_prompt=initial_prompt,
@@ -1256,13 +1341,18 @@ class AgentSolver:
 
                 continuations = 0
                 last_failed_code = code
-                last_feedback = exec_result.feedback[-2000:]
+                last_feedback = err_msg[-6500:] if REPAIR_V2 else exec_result.feedback[-2000:]
                 signature = exec_result.error_signature
                 repeated = bool(signature) and signature == last_error
                 last_error = signature
                 if repeated:
                     logger.warning("Same error as the previous attempt: %s", signature[:120])
                 edit_base = code
+                if REPAIR_V2 and repeated:
+                    compact_mode = True
+                    user_prompt = build_compact_rewrite_prompt(initial_prompt, last_feedback)
+                    logger.warning("Repeated execution failure; switching repair strategy")
+                    continue
                 user_prompt = build_repair_prompt(
                     edit_mode=_edit_mode(code),
                     task_prompt=initial_prompt,
@@ -1451,32 +1541,43 @@ class AgentSolver:
         lines reach the solution repair loop; other verifier errors repair the verifier first.
         If verification remains incomplete, the normal review still evaluates the clean run.
         """
-        prompt = build_verify_prompt(
-            task_prompt,
-            code,
-            build_input_previews(self.out_dir, output_files(self.out_dir), label="OUTPUT_DIR"),
+        self._last_numeric_audit = ""
+        prompt = (
+            build_numerical_audit_prompt(
+                task_prompt, [str(p.relative_to(self.out_dir)) for p in output_files(self.out_dir)]
+            )
+            if REPAIR_V2
+            else build_verify_prompt(
+                task_prompt,
+                code,
+                build_input_previews(self.out_dir, output_files(self.out_dir), label="OUTPUT_DIR"),
+            )
         )
         base_prompt = prompt
         variants = self._prompt_variants(self.out_dir)
+        audit_system = AUDIT_SYSTEM_PROMPT if REPAIR_V2 else SYSTEM_PROMPT
         for recovery in range(MAX_VERIFIER_RECOVERIES + 1):
-            fitted = fit_to_context(prompt, task_prompt, variants)
+            fitted = fit_to_context(prompt, task_prompt, variants, system_prompt=audit_system)
             if fitted is None:
                 return ""
             try:
                 result = self._chat(
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "system",
+                            "content": audit_system,
+                        },
                         {"role": "user", "content": fitted[0]},
                     ],
                     temperature=0.0,
                     max_tokens=fitted[2],
-                    phase="verify",
+                    phase="audit" if REPAIR_V2 else "verify",
                 )
             except Exception:
                 logger.exception("Verifier request failed; continuing with normal review")
                 return ""
             verifier = extract_python_code(result.content)
-            if verifier:
+            if verifier and not (REPAIR_V2 and result.truncated):
                 timeout = self._execution_timeout(VERIFY_TIMEOUT_SEC, reserve=30)
                 if timeout is None:
                     logger.warning("Verification incomplete: insufficient execution time")
@@ -1486,13 +1587,13 @@ class AgentSolver:
                     shutil.rmtree(copy_dir)
                 shutil.copytree(accepted_dir, copy_dir)
                 run = run_code(
-                    verifier,
+                    audited_tests(verifier) if REPAIR_V2 else verifier,
                     work_dir / "verify",
                     copy_dir,
                     task_dir=self.task_dir,
                     timeout_sec=timeout,
                 )
-                evidence = verifier_result(run)
+                evidence = test_evidence(run) if REPAIR_V2 else verifier_result(run)
                 logger.info(
                     "Verifier: %d PASS, %d FAIL (returncode=%d)",
                     evidence.passes,
@@ -1500,8 +1601,12 @@ class AgentSolver:
                     run.returncode,
                 )
                 if evidence.failures:
+                    if REPAIR_V2:
+                        self._last_numeric_audit = verifier
                     return "Verifier failures:\n" + "\n".join(evidence.failures[:20])[:6500]
                 if not evidence.incomplete and not result.truncated:
+                    if REPAIR_V2:
+                        self._last_numeric_audit = verifier
                     return ""
                 feedback = evidence.incomplete or (
                     "The verification response was truncated. Return a complete verifier "

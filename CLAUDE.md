@@ -208,6 +208,18 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   image `27e6cb3`, four runs at `-j 8`, 1000 s budget): tests passed 19/20 vs 18/17 control,
   mean pass@1 0.227 vs 0.203, 8.75 vs 6.74 requests and 414 vs 360 s/unit. This is a modest
   positive signal from two runs per arm; keep the default off until confirmed.
+- Repair v2 (`AGENT_REPAIR_V2=1`, default off, matched pilot pending): reject a truncated or
+  unclosed edit batch atomically, including an early complete block in a truncated response.
+  Exhausted continuations, unchanged failing code, repeated execution exceptions and two
+  unmatched edit replies switch to a compact complete rewrite with reasoning off. Retain
+  static, execution and missing-output feedback in recovery prompts. After clean outputs,
+  an executable numerical audit sees the task and inputs but no solution code or output values.
+  Audit requests use reasoning off; only checks that read actual copied deliverables supply
+  output evidence. Freeze complete audits and rerun them after rewrites; measured failures
+  trigger bounded repairs and cannot replace an audited-valid snapshot. Incomplete audits
+  get one recovery, then fall back to ordinary review. All calls consume the same unit budget;
+  passing an internal audit does not establish benchmark correctness. See
+  [agent/feedback.md](agent/feedback.md) for the regression command and comparison plan.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
   (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
   replaces the fixed review/verifier caps (up to 4 reviews / 3 verifier rounds while

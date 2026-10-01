@@ -52,8 +52,9 @@ def default_policy(monkeypatch):
         "SPEC_CHECKS",
         "EXAMPLES",
         "GUARDRAILS",
+        "REPAIR_V2",
     ):
-        monkeypatch.setattr(loop, name, False)
+        monkeypatch.setattr(loop, name, False, raising=False)
     monkeypatch.setattr(loop, "CANDIDATES", 1)
     monkeypatch.setattr(loop, "EXPLORE_STEPS", 0)
 
@@ -67,6 +68,139 @@ def solver_for(tmp_path, client):
 
 def price(tmp_path):
     return json.loads((tmp_path / "out" / "r.json").read_text())["price"]
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "stop"])
+@pytest.mark.parametrize("marker_width", [5, 7, 9])
+def test_repair_v2_never_executes_a_truncated_edit_batch(
+    tmp_path, monkeypatch, finish_reason, marker_width
+):
+    monkeypatch.setattr(loop, "REPAIR_V2", True, raising=False)
+    bad = "```python\n" + "# line\n" * 80 + "raise ValueError('original_error')\n```"
+    partial = (
+        "<<<<<<< SEARCH\nraise ValueError('original_error')\n=======\n"
+        + extract_python_code(writer(1.5))
+        + "\n>>>>>>> REPLACE\n<<<<<<< SEARCH\nunfinished"
+    )
+    partial = (
+        partial.replace("<<<<<<<", "<" * marker_width)
+        .replace("=======", "=" * marker_width)
+        .replace(">>>>>>>", ">" * marker_width)
+    )
+    client = RecordedClient(bad, ChatResult(partial, finish_reason), writer(2.5))
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 2
+    assert solver.run()
+    assert client.requests[2][1]["phase"] == "repair"
+    assert "truncated" in client.requests[2][0].lower()
+    assert price(tmp_path) == 2.5
+
+
+def test_repair_v2_preserves_static_failure_when_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True, raising=False)
+    bad = "```python\nimport unavailable_example_package\n```"
+    client = RecordedClient(bad, bad, writer(2.5))
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 2
+    assert solver.run()
+    prompt = client.requests[2][0]
+    assert "unavailable_example_package" in prompt
+    assert "not installed" in prompt
+
+
+def test_repair_v2_exhausted_continuations_switch_to_compact_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True)
+    client = RecordedClient(
+        ChatResult("```python\nimport os\n", "length"),
+        ChatResult("```python\nx = 1\n", "length"),
+        ChatResult("```python\ny = 2\n", "length"),
+        writer(2.5),
+    )
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 3
+    assert solver.run()
+    assert [kw["phase"] for _, kw in client.requests] == [
+        "generate",
+        "continue",
+        "continue",
+        "compact",
+    ]
+    assert "EVERY required deliverable" in client.requests[-1][0]
+    assert price(tmp_path) == 2.5
+
+
+def test_repair_v2_closed_prefix_of_truncated_solution_is_not_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True)
+    client = RecordedClient(
+        ChatResult(writer(1.5) + "\n```python\nunfinished", "length"), writer(2.5)
+    )
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 1
+
+    def before_next_request(number):
+        if number == 2:
+            assert not (solver.out_dir / "r.json").exists()
+
+    client.after_response = before_next_request
+    assert solver.run()
+    assert client.requests[1][1]["phase"] == "compact"
+
+
+def test_repair_v2_repeated_execution_error_changes_repair_strategy(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True)
+    bad = "```python\nraise ValueError('same_failure')\n```"
+    different_but_bad = "```python\nx = 1\nraise ValueError('same_failure')\n```"
+    client = RecordedClient(bad, different_but_bad, writer(2.5))
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 2
+    assert solver.run()
+    assert client.requests[2][1]["phase"] == "compact"
+    assert "same_failure" in client.requests[2][0]
+
+
+def test_repair_v2_numeric_audit_repairs_and_rechecks_frozen_test(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True, raising=False)
+    client = RecordedClient(writer(1.5), PRICE_TEST, writer(1.75), writer(2.5))
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 2
+    assert solver.run()
+    assert price(tmp_path) == 2.5
+    assert client.requests[1][1]["phase"] == "audit"
+    assert "SCRIPT THAT PRODUCED" not in client.requests[1][0]
+    assert "price expected 2.5 got 1.75" in client.requests[3][0]
+
+
+def test_repair_v2_input_only_audit_has_no_output_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True)
+    client = RecordedClient(
+        writer(2.5),
+        "```python\nassert False, 'input_only'\n```",
+        "```python\nprint('PASS: inputs')\n```",
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert solver._last_numeric_audit == ""
+    assert price(tmp_path) == 2.5
+
+
+def test_repair_v2_truncated_audit_is_not_executed(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True)
+    partial = PRICE_TEST.replace("value == 2.5", "value == 99")
+    client = RecordedClient(writer(2.5), ChatResult(partial, "length"), PRICE_TEST, "VERDICT: PASS")
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert client.request_count == 4
+    assert solver._last_numeric_audit == extract_python_code(PRICE_TEST)
+
+
+def test_repair_v2_keeps_audited_outputs_after_bad_review_rewrite(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "REPAIR_V2", True)
+    client = RecordedClient(writer(2.5), PRICE_TEST, "VERDICT: FAIL\n" + writer(1.5))
+    solver = solver_for(tmp_path, client)
+    solver.max_retries = 1
+    assert solver.run()
+    assert price(tmp_path) == 2.5
 
 
 def test_guardrails_repair_schema_despite_a_model_pass(tmp_path, monkeypatch):

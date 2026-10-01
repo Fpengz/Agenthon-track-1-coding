@@ -139,6 +139,12 @@ _EDIT_BLOCK = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 EDIT_MARKER = "<<<<<<< SEARCH"
+EDIT_START = re.compile(r"^<{5,9} ?SEARCH[ \t]*$", re.MULTILINE)
+
+
+def incomplete_edit_batch(response: str) -> bool:
+    answer = strip_reasoning(response)
+    return len(EDIT_START.findall(answer)) != len(_EDIT_BLOCK.findall(answer))
 
 
 def _indent(line: str) -> str:
