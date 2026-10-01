@@ -105,3 +105,91 @@ def test_skills_summary_advertises_metric_conventions():
         "include_initial",
     ):
         assert term in summary
+
+
+@pytest.mark.parametrize("df, loc, scale, alpha", [(3, 0, 1, 0.95), (8, -0.7, 1.8, 0.99)])
+def test_student_t_risk_matches_independent_tail_integration(df, loc, scale, alpha):
+    from scipy.integrate import quad
+    from scipy.stats import t
+
+    result = skills.student_t_var_es(df, loc, scale, alpha)
+    distribution = t(df, loc=loc, scale=scale)
+    assert distribution.cdf(result["var"]) == pytest.approx(alpha, abs=1e-12)
+    integral = quad(lambda x: x * distribution.pdf(x), result["var"], np.inf)[0]
+    assert result["es"] == pytest.approx(integral / (1 - alpha), rel=1e-8)
+
+
+def test_normal_mixture_reduces_to_single_normal_and_respects_loss_convention():
+    from scipy.stats import norm
+
+    mean, sigma, alpha = -0.4, 1.7, 0.975
+    expected_var = mean + sigma * norm.ppf(alpha)
+    expected_es = mean + sigma * norm.pdf(norm.ppf(alpha)) / (1 - alpha)
+    result = skills.normal_mixture_var_es([3, 7], [mean, mean], [sigma, sigma], alpha)
+    assert result["var"] == pytest.approx(expected_var, abs=1e-10)
+    assert result["es"] == pytest.approx(expected_es, abs=1e-10)
+    # The existing Normal helper takes RETURNS; the new ones take LOSSES.
+    assert result == pytest.approx(skills.parametric_var_es(-mean, sigma, alpha))
+    assert skills.normal_mixture_var_es(
+        [1e308, 1e308], [mean, mean], [sigma, sigma], alpha
+    ) == pytest.approx(result)
+
+
+def test_heterogeneous_mixture_tail_matches_density_integration():
+    from scipy.integrate import quad
+    from scipy.stats import norm
+
+    weights, means, sigmas, alpha = np.array([0.7, 0.3]), [-0.3, 1.2], [0.8, 2.0], 0.97
+    result = skills.normal_mixture_var_es(weights, means, sigmas, alpha)
+
+    def density(x):
+        return float(weights @ norm.pdf(x, loc=means, scale=sigmas))
+
+    cdf = quad(density, -np.inf, result["var"])[0]
+    tail = quad(lambda x: x * density(x), result["var"], np.inf)[0]
+    assert cdf == pytest.approx(alpha, abs=1e-10)
+    assert result["es"] == pytest.approx(tail / (1 - alpha), rel=1e-9)
+
+
+def test_kde_risk_matches_scipy_density_and_cdf_integrals():
+    from scipy.integrate import quad
+    from scipy.stats import gaussian_kde
+
+    losses = np.array([-2.0, -0.4, 0.2, 0.8, 2.1])
+    weights, alpha = [1, 2, 1, 3, 1], 0.95
+    fitted = gaussian_kde(losses, bw_method="silverman", weights=weights)
+    result = skills.kde_var_es(losses, alpha, weights=weights)
+    assert fitted.integrate_box_1d(-np.inf, result["var"]) == pytest.approx(alpha, abs=1e-12)
+    tail = quad(lambda x: x * float(fitted([x])[0]), result["var"], np.inf)[0]
+    assert result["es"] == pytest.approx(tail / (1 - alpha), rel=1e-9)
+
+
+def test_kde_grid_interpolation_and_location_scale_conventions():
+    losses = np.array([-2.0, -0.4, 0.2, 0.8, 2.1])
+    direct = skills.kde_var_es(losses, 0.975)
+    grid = skills.kde_var_es(losses, 0.975, quantile_grid_size=1024)
+    assert grid == pytest.approx(direct, rel=1e-4)
+    transformed = skills.kde_var_es(2 * losses + 3, 0.975)
+    assert transformed == pytest.approx({key: 2 * value + 3 for key, value in direct.items()})
+
+
+@pytest.mark.parametrize("df, scale, alpha", [(1, 1, 0.99), (3, 0, 0.99), (3, 1, 1.0)])
+def test_undefined_student_t_tail_expectations_are_rejected(df, scale, alpha):
+    with pytest.raises(ValueError):
+        skills.student_t_var_es(df, scale=scale, alpha=alpha)
+
+
+@pytest.mark.parametrize(
+    "weights, means, sigmas",
+    [([0, 0], [0, 1], [1, 1]), ([1, -1], [0, 1], [1, 1]), ([1], [0, 1], [1]), ([1], [0], [0])],
+)
+def test_invalid_mixture_parameters_are_rejected(weights, means, sigmas):
+    with pytest.raises(ValueError):
+        skills.normal_mixture_var_es(weights, means, sigmas)
+
+
+def test_tail_skills_are_advertised_only_for_relevant_tasks():
+    summary = skills.skills_summary("Fit a Student-t distribution and kernel density estimate.")
+    for name in ("student_t_var_es", "normal_mixture_var_es", "kde_var_es", "quantile_grid_size"):
+        assert name in summary
+    assert "kde_var_es" not in skills.skills_summary("Compute a coupon bond's duration.")

@@ -141,7 +141,13 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   Performance helpers expose simple/log returns, arithmetic/geometric annualisation,
   arithmetic/CAGR Sharpe, ddof, risk-free rate units and initial wealth for drawdown; choose
   each convention from the task instruction. Existing helper defaults remain compatible.
-  A/B pending. Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
+  An eight-unit, two-run simultaneous pilot (`20261001-0852-ability-*`) passed 2/3 control
+  vs 3/1 skills v2; no demonstrated gain. Domain helper use was confined to Black-Scholes.
+  The expanded risk helpers add Student-t loss VaR/ES, normal-mixture inverse CDF/tail
+  moments, and Gaussian KDE VaR/ES without repeated density integration, with optional CDF
+  grid interpolation. These use upper-tail LOSSES (negate returns); component sigmas are
+  standard deviations. Tested against independent SciPy integrals; adoption A/B pending.
+  Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
   only re-read what the input previews already show; it stays off.
 - Spec-first tests (`AGENT_TESTS=1`, default off; A/B pending): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt

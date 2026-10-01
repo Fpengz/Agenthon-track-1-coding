@@ -12,7 +12,8 @@ almost none used anything else, because the helpers did not address where answer
 The reference implementations are general-purpose textbook formulas tested against analytic
 values (never against a unit's checker); conventions are explicit arguments. They serve the
 solution and, more importantly, the verifier, which needs numbers that do not share the
-solution's misconceptions. Every function is unit-tested in tests/test_base_agent.py.
+solution's misconceptions. Analytic tests live in tests/test_base_agent.py and
+tests/test_agent_skills.py.
 """
 
 from __future__ import annotations
@@ -354,6 +355,114 @@ def parametric_var_es(mu: float, sigma: float, alpha: float = 0.99) -> dict[str,
     }
 
 
+def student_t_var_es(
+    df: float, loc: float = 0.0, scale: float = 1.0, alpha: float = 0.99
+) -> dict[str, float]:
+    """Upper-tail risk for Student-t LOSSES, with scipy's location-scale convention.
+
+    ES exists for df > 1. No variance standardisation is applied. For return data, use
+    losses = -returns and negate the fitted location; keep scale unchanged.
+    """
+    from scipy.stats import t
+
+    if not (df > 1 and scale > 0 and 0 < alpha < 1):
+        raise ValueError("Student-t ES needs df > 1, scale > 0 and 0 < alpha < 1")
+    if not all(math.isfinite(v) for v in (df, loc, scale)):
+        raise ValueError("Student-t parameters must be finite")
+    z = float(t.ppf(alpha, df))
+    tail_mean = (df + z * z) / (df - 1) * float(t.pdf(z, df)) / (1 - alpha)
+    return {"var": loc + scale * z, "es": loc + scale * tail_mean}
+
+
+def normal_mixture_var_es(
+    weights: Any,
+    means: Any,
+    sigmas: Any,
+    alpha: float = 0.99,
+    *,
+    quantile_grid_size: int | None = None,
+) -> dict[str, float]:
+    """Upper-tail VaR/ES for a mixture of normal LOSS distributions.
+
+    Component sigmas are standard deviations, not variances. Weights are normalised. VaR
+    inverts the mixture CDF; ES uses exact Gaussian tail first moments. Set quantile_grid_size
+    for a fine-grid CDF interpolation when the specification requires that procedure.
+    """
+    from scipy.optimize import brentq
+    from scipy.stats import norm
+
+    w, mu, sd = (np.asarray(v, dtype=float) for v in (weights, means, sigmas))
+    if not (
+        0 < alpha < 1
+        and w.ndim == mu.ndim == sd.ndim == 1
+        and w.size == mu.size == sd.size
+        and w.size > 0
+        and all(np.isfinite(v).all() for v in (w, mu, sd))
+        and (w >= 0).all()
+        and (w > 0).any()
+        and (sd > 0).all()
+    ):
+        raise ValueError("Need finite mixture vectors, nonnegative weights, positive sigmas/alpha")
+    w = w / w.max()  # avoid overflow when unnormalised weights are large
+    w = w / w.sum()
+    component_quantiles = mu + sd * norm.ppf(alpha)
+    low = float(component_quantiles.min() - sd.max())
+    high = float(component_quantiles.max() + sd.max())
+
+    def gap(x: float) -> float:
+        z = (x - mu) / sd
+        # Survival probabilities avoid cancellation for high confidence levels.
+        if alpha > 0.5:
+            return float((1 - alpha) - w @ norm.sf(z))
+        return float(w @ norm.cdf(z) - alpha)
+
+    if quantile_grid_size is None:
+        value = float(brentq(gap, low, high, xtol=1e-12))
+    else:
+        if quantile_grid_size < 2:
+            raise ValueError("quantile_grid_size must be at least 2")
+        grid = np.linspace(low, high, quantile_grid_size)
+        # Bound memory even when a KDE has thousands of mixture components.
+        cdf = np.concatenate(
+            [
+                norm.cdf((chunk[:, None] - mu) / sd) @ w
+                for chunk in np.array_split(grid, max(1, (len(grid) + 127) // 128))
+            ]
+        )
+        value = float(np.interp(alpha, cdf, grid))
+    z = (value - mu) / sd
+    es = float(w @ (mu * norm.sf(z) + sd * norm.pdf(z)) / (1 - alpha))
+    return {"var": value, "es": es}
+
+
+def kde_var_es(
+    losses: Any,
+    alpha: float = 0.99,
+    bw_method: Any = "silverman",
+    *,
+    weights: Any = None,
+    quantile_grid_size: int | None = None,
+) -> dict[str, float]:
+    """One-dimensional Gaussian KDE risk for LOSSES, using scipy bandwidth conventions.
+
+    A Gaussian KDE is a normal mixture: its CDF and ES can be computed without repeated
+    numerical integration of the density. Pass quantile_grid_size for CDF grid interpolation,
+    or leave it None for direct CDF inversion. Convert returns to losses before calling.
+    """
+    from scipy.stats import gaussian_kde
+
+    fitted = gaussian_kde(np.asarray(losses, dtype=float), bw_method=bw_method, weights=weights)
+    values = fitted.dataset[0]
+    sigma = math.sqrt(float(fitted.covariance[0, 0]))
+    return normal_mixture_var_es(
+        fitted.weights,
+        values,
+        np.full(values.shape, sigma),
+        alpha,
+        quantile_grid_size=quantile_grid_size,
+    )
+
+
 def gbm_paths(
     S0: float,
     r: float,
@@ -442,6 +551,17 @@ _FAMILIES: list[tuple[str, str]] = [
         "  alpha=0.99) -> dict var, es as POSITIVE losses (alpha is the confidence level).",
     ),
     (
+        r"student.?t|heavy.tail|gaussian.{0,30}mixture|contaminated normal|kernel density|\bkde\b",
+        "- student_t_var_es(df, loc=0.0, scale=1.0, alpha=0.99): scipy location-scale t, df>1.\n"
+        "- normal_mixture_var_es(weights, means, sigmas, alpha=0.99): sigmas are standard\n"
+        "  deviations; exact mixture CDF inversion and analytic tail first moment.\n"
+        "- kde_var_es(losses, alpha=0.99, bw_method='silverman', weights=None): Gaussian KDE\n"
+        "  with exact CDF inversion and tail moments, avoiding costly density integration.\n"
+        "  Both mixture and KDE accept quantile_grid_size=N for CDF grid interpolation.\n"
+        "  All three return dict var, es for the UPPER TAIL of LOSSES; convert returns to\n"
+        "  losses by negating them, including the fitted location for Student-t.",
+    ),
+    (
         r"monte.?carlo|geometric brownian|\bgbm\b|simulat\w+ path",
         "- gbm_paths(S0, r, sigma, T, steps, n_paths, seed=None, q=0.0, antithetic=False) ->\n"
         "  array (n_paths, steps + 1), exact risk-neutral GBM from numpy default_rng(seed).",
@@ -466,7 +586,8 @@ _FAMILIES: list[tuple[str, str]] = [
 _SKILLS_HEADER = (
     "Helper module `agent_skills` (importable next to your script). Textbook reference\n"
     "implementations, tested against analytic values. Conventions are arguments: set them to\n"
-    "what the TASK SPECIFICATION says, and if the specification defines a formula differently,\n"
+    "what the TASK SPECIFICATION says. Use the reference helpers for matching calculations\n"
+    "rather than reimplementing their formulas. If the specification defines a formula differently,\n"
     "follow the specification.\n"
     "- write_json(path, obj): REQUIRED for every JSON deliverable; strict JSON, NaN/inf -> null,\n"
     "  numpy/pandas values ok."
