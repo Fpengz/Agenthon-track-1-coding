@@ -149,7 +149,7 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   standard deviations. Tested against independent SciPy integrals; adoption A/B pending.
   Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
   only re-read what the input previews already show; it stays off.
-- Spec-first tests (`AGENT_TESTS=1`, default off; A/B pending): one test-writing request overlaps
+- Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B pending): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
   previews. A complete suite is frozen and re-executed on fresh output copies after each clean
@@ -161,6 +161,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   reserve the 4,000-token cap for a compact executable suite; solution generation stays low.
   Generation is capped at 120 s; tests are not used with
   consensus candidates. Record and forward this switch in all experiment/container runs.
+  The revised eight-unit pilot (`20261001-0910-ability2-*`, two runs/arm, simultaneous)
+  passed 3/3 with tests vs 2/2 control: 8.3 vs 7.4 requests and 274 vs 248 s/unit. This subset
+  signal is insufficient to change defaults; compare over the full 86-unit roster first.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
   (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
   replaces the fixed review/verifier caps (up to 4 reviews / 3 verifier rounds while
