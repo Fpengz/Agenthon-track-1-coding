@@ -31,7 +31,9 @@ from agent.inputs import build_input_previews
 from agent.knowledge import domain_notes, read_card
 from agent.preflight import preflight
 from agent.prompts import (
+    PROBE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    TOOL_SYSTEM_PROMPT,
     VERIFY_REPAIR_HEADLINE,
     build_continuation_prompt,
     build_exploration_section,
@@ -40,6 +42,7 @@ from agent.prompts import (
     build_no_code_prompt,
     build_plan_prompt,
     build_probe_instruction,
+    build_probe_request,
     build_repair_prompt,
     build_review_prompt,
     build_review_retry_prompt,
@@ -123,6 +126,7 @@ EXPLORE_TIMEOUT_SEC = 60
 EXPLORE_OUTPUT_CHARS = 2500
 EXPLORE_SOURCE_CHARS = 3000
 EXPLORE_LOG_CHARS = 7000
+MAX_PROBE_RECOVERIES = 1
 SKILLS = os.environ.get("AGENT_SKILLS", "0").strip().lower() in {"1", "true", "on"}
 _EXPLORE_BLOCK = re.compile(r"^```[ \t]*explore[^\n]*\n(.*?)^```[ \t]*$", re.S | re.M | re.I)
 _EXPLORE_START = re.compile(r"^```[ \t]*explore\b", re.M | re.I)
@@ -156,12 +160,12 @@ _DROP_ORDER: list[frozenset[str]] = [
 ]
 
 
-def _estimated_tokens(user_prompt: str) -> int:
-    return int((len(SYSTEM_PROMPT) + len(user_prompt)) / CHARS_PER_TOKEN)
+def _estimated_tokens(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> int:
+    return int((len(system_prompt) + len(user_prompt)) / CHARS_PER_TOKEN)
 
 
 def fit_to_context(
-    user_prompt: str, task_prompt: str, variants: list[str]
+    user_prompt: str, task_prompt: str, variants: list[str], *, system_prompt: str = SYSTEM_PROMPT
 ) -> tuple[str, str, int] | None:
     """Make a request fit the context window: ``(user_prompt, task_prompt, max_tokens)``.
 
@@ -170,21 +174,21 @@ def fit_to_context(
     cap, the output cap shrinks; ``None`` if not even ``MIN_OUTPUT_TOKENS`` would remain.
     """
     budget = CONTEXT_TOKENS - MAX_OUTPUT_TOKENS - CONTEXT_MARGIN_TOKENS
-    if _estimated_tokens(user_prompt) <= budget:
+    if _estimated_tokens(user_prompt, system_prompt) <= budget:
         return user_prompt, task_prompt, MAX_OUTPUT_TOKENS
     suffix = user_prompt[len(task_prompt) :] if user_prompt.startswith(task_prompt) else None
     if suffix is not None:
         start = variants.index(task_prompt) + 1 if task_prompt in variants else len(variants)
         for variant in variants[start:]:
             task_prompt, user_prompt = variant, variant + suffix
-            if _estimated_tokens(user_prompt) <= budget:
+            if _estimated_tokens(user_prompt, system_prompt) <= budget:
                 logger.warning(
                     "Prompt too large for the context window; using a leaner task prompt "
                     "(~%d tokens)",
-                    _estimated_tokens(user_prompt),
+                    _estimated_tokens(user_prompt, system_prompt),
                 )
                 return user_prompt, task_prompt, MAX_OUTPUT_TOKENS
-    room = CONTEXT_TOKENS - CONTEXT_MARGIN_TOKENS - _estimated_tokens(user_prompt)
+    room = CONTEXT_TOKENS - CONTEXT_MARGIN_TOKENS - _estimated_tokens(user_prompt, system_prompt)
     if room < MIN_OUTPUT_TOKENS:
         return None
     logger.warning("Prompt near the context limit; reducing the output cap to %d tokens", room)
@@ -544,6 +548,9 @@ class AgentSolver:
         spec_repairs = 0
         verifies = 0
         explore_steps = 0
+        initial_probe_done = False
+        review_probe_done = False
+        probe_recoveries = 0
         exploration_log: list[tuple[str, str]] = []
         verify_code = ""  # the script a verifier-driven repair was asked about
         test_code: str | None = None
@@ -565,7 +572,7 @@ class AgentSolver:
                     {"role": "user", "content": user_prompt},
                 ]
                 try:
-                    phase = (
+                    pending_phase = (
                         "review"
                         if reviewing
                         else "continue"
@@ -574,18 +581,38 @@ class AgentSolver:
                         if edit_base
                         else "generate"
                     )
-                    probe_instruction = (
-                        build_probe_instruction(
-                            min(EXPLORE_STEPS - explore_steps, max(0, self._requests_left() - 1))
-                            if self._can_afford(2, EXPLORE_TIMEOUT_SEC)
-                            else 0,
-                            phase,
+                    probe_allowance = (
+                        min(EXPLORE_STEPS - explore_steps, max(0, self._requests_left() - 1))
+                        if EXPLORE_STEPS and self._can_afford(2, EXPLORE_TIMEOUT_SEC)
+                        else 0
+                    )
+                    explicit_probe = bool(
+                        probe_allowance
+                        and (
+                            (pending_phase == "generate" and not initial_probe_done)
+                            or (pending_phase == "review" and not review_probe_done)
                         )
+                    )
+                    phase = "probe" if explicit_probe else pending_phase
+                    system_prompt = (
+                        PROBE_SYSTEM_PROMPT
+                        if explicit_probe
+                        else TOOL_SYSTEM_PROMPT
+                        if EXPLORE_STEPS
+                        else SYSTEM_PROMPT
+                    )
+                    probe_instruction = (
+                        build_probe_request(pending_phase)
+                        if explicit_probe
+                        else build_probe_instruction(probe_allowance, pending_phase)
                         if EXPLORE_STEPS
                         else ""
                     )
                     fitted = fit_to_context(
-                        user_prompt + probe_instruction, initial_prompt, prompt_variants
+                        user_prompt + probe_instruction,
+                        initial_prompt,
+                        prompt_variants,
+                        system_prompt=system_prompt,
                     )
                     if fitted is None:
                         logger.error("Request cannot fit the model context window; stopping")
@@ -594,7 +621,10 @@ class AgentSolver:
                     # Keep phase instructions out of saved state; they change when the
                     # pending operation or tool allowance changes.
                     user_prompt = request_prompt.removesuffix(probe_instruction)
+                    messages[0]["content"] = system_prompt
                     messages[1]["content"] = request_prompt
+                    if explicit_probe:
+                        logger.info("Requesting numerical probe before %s", pending_phase)
                     result = self._chat(
                         messages=messages,
                         temperature=temperature,
@@ -606,6 +636,40 @@ class AgentSolver:
                     break
 
                 answer = strip_reasoning(result.content)
+                code = extract_python_code(result.content)
+                explore = (
+                    _EXPLORE_BLOCK.search(answer)
+                    if EXPLORE_STEPS and pending_phase != "continue"
+                    else None
+                )
+                if explicit_probe:
+                    if result.truncated or not (code or explore):
+                        retry = probe_recoveries < MAX_PROBE_RECOVERIES and self._can_afford(
+                            2, EXPLORE_TIMEOUT_SEC
+                        )
+                        if retry:
+                            probe_recoveries += 1
+                        else:
+                            initial_probe_done |= pending_phase == "generate"
+                            review_probe_done |= pending_phase == "review"
+                            explore_steps += 1
+                            probe_recoveries = 0
+                        user_prompt = (
+                            f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
+                            "The previous numerical probe response was incomplete and was NOT "
+                            "executed. "
+                            + (
+                                "Return one complete compact diagnostic program in ```python```."
+                                if retry
+                                else "Its recovery budget is exhausted; finish the pending "
+                                f"{pending_phase} without those observations."
+                            )
+                        )
+                        logger.warning("Probe incomplete before %s; retry=%s", pending_phase, retry)
+                        continue
+                    initial_probe_done |= pending_phase == "generate"
+                    review_probe_done |= pending_phase == "review"
+                    probe_recoveries = 0
                 if EXPLORE_STEPS and phase == "continue" and _EXPLORE_START.search(answer):
                     user_prompt = (
                         f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
@@ -629,21 +693,17 @@ class AgentSolver:
                     )
                     logger.warning("Truncated probe was not executed; resuming %s", phase)
                     continue
-                code = extract_python_code(result.content)
                 # Execute a requested probe before interpreting a solution or verdict.
                 # Its observations must precede the decision, even if both were returned.
-                explore = (
-                    _EXPLORE_BLOCK.search(answer) if EXPLORE_STEPS and phase != "continue" else None
-                )
+                snippet = explore.group(1).strip() if explore else code if explicit_probe else ""
                 if (
-                    explore
+                    snippet
                     and explore_steps < EXPLORE_STEPS
                     and self._can_afford(1, EXPLORE_TIMEOUT_SEC)
                 ):
                     # Keep the pending repair/review and its edit base; probes never
                     # delete or overwrite the actual clean deliverables.
                     explore_steps += 1
-                    snippet = explore.group(1).strip()
                     observation = self._explore(
                         snippet, work_dir, accepted_dir if have_accepted else self.out_dir
                     )
@@ -654,7 +714,9 @@ class AgentSolver:
                         if executed_turn
                         else "no solution executed yet"
                     )
-                    observation = f"Context: {phase}; output copy: {output_version}\n{observation}"
+                    observation = (
+                        f"Context: {pending_phase}; output copy: {output_version}\n{observation}"
+                    )
                     source = (
                         snippet
                         if len(snippet) <= EXPLORE_SOURCE_CHARS
@@ -670,8 +732,8 @@ class AgentSolver:
                         "Exploration step %d/%d during %s; resuming %s",
                         explore_steps,
                         EXPLORE_STEPS,
-                        phase,
-                        phase,
+                        pending_phase,
+                        pending_phase,
                     )
                     # Evidence is required context, including after a repair, review or
                     # context-window fallback. Preserve the pending operation's suffix.
@@ -682,7 +744,9 @@ class AgentSolver:
                     initial_prompt = prompt_variants[variant_index]
                     user_prompt = initial_prompt + suffix
                     continue
-                if explore and not code:
+                if explicit_probe or (explore and not code):
+                    if explicit_probe:
+                        explore_steps += 1
                     user_prompt = (
                         f"{user_prompt.split(NO_CODE_MARKER)[0]}{NO_CODE_MARKER}"
                         "The probe was NOT executed: no tool allowance or follow-up budget "
@@ -995,6 +1059,8 @@ class AgentSolver:
                     findings = output_diagnostics(self.out_dir)
                     reviews += 1
                     review_recoveries = 0
+                    review_probe_done = False
+                    probe_recoveries = 0
                     reviewing = True
                     continuations = 0
                     edit_base = code

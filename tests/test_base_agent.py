@@ -771,7 +771,7 @@ def test_requirements_checklist_is_requested_once_and_used(tmp_path, monkeypatch
 def test_exploration_output_reaches_the_next_prompt(tmp_path, monkeypatch):
     from agent import loop
 
-    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
     client = ScriptedClient("```explore\nprint(6 * 7)\n```", WRITE_OK, "VERDICT: PASS")
     assert _solver(tmp_path, client).run()
     assert client.request_count == 3
@@ -783,7 +783,7 @@ def test_exploration_output_reaches_the_next_prompt(tmp_path, monkeypatch):
 def test_first_exploration_wins_over_a_script_in_the_same_reply(tmp_path, monkeypatch):
     from agent import loop
 
-    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
     both = "```explore\nprint(6 * 7)\n```\n" + _writer(9)
     client = ScriptedClient(both, WRITE_OK, "VERDICT: PASS")
     assert _solver(tmp_path, client).run()

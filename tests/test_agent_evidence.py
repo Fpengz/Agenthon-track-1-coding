@@ -28,11 +28,13 @@ class RecordedClient:
         self.responses = list(responses)
         self.request_count = 0
         self.requests = []
+        self.systems = []
         self.after_response = None
 
     def chat(self, messages, **kwargs):
         self.request_count += 1
         self.requests.append((messages[-1]["content"], kwargs))
+        self.systems.append(messages[0]["content"])
         response = self.responses.pop(0)
         if self.after_response:
             self.after_response(self.request_count)
@@ -58,6 +60,27 @@ def price(tmp_path):
     return json.loads((tmp_path / "out" / "r.json").read_text())["price"]
 
 
+def test_initial_python_probe_is_not_a_solution_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    probe = writer(999).replace("\n```", "\nprint('measured_price=2.5')\n```")
+    client = RecordedClient(probe, writer(2.5), "VERDICT: PASS")
+    solver = solver_for(tmp_path, client)
+
+    def check_before_solution(number):
+        if number == 2:
+            assert not (solver.out_dir / "r.json").exists(), "probe wrote real deliverables"
+
+    client.after_response = check_before_solution
+    assert solver.run()
+    assert price(tmp_path) == 2.5
+    assert [kwargs["phase"] for _, kwargs in client.requests] == ["probe", "generate", "review"]
+    assert "measured_price=2.5" in client.requests[1][0]
+    assert "missing deliverable" not in client.requests[1][0]
+    assert client.systems[0] == loop.PROBE_SYSTEM_PROMPT
+    assert client.systems[1] == loop.TOOL_SYSTEM_PROMPT
+    assert "CURRENT PHASE: NUMERICAL PROBE BEFORE GENERATE" in client.requests[0][0]
+
+
 @pytest.mark.parametrize("failed_solution", [False, True])
 def test_numeric_probe_evidence_survives_repair_and_review(tmp_path, monkeypatch, failed_solution):
     monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
@@ -75,20 +98,28 @@ def test_numeric_probe_evidence_survives_repair_and_review(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("closing_fence", ["\n```", ""])
-def test_truncated_probe_is_not_executed(tmp_path, monkeypatch, closing_fence):
+@pytest.mark.parametrize("language", ["python", "explore"])
+def test_truncated_probe_is_not_executed(tmp_path, monkeypatch, closing_fence, language):
     monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
     snippet = (
         "import os, pathlib\n(pathlib.Path(os.environ['TASK_DIR']) / 'partial_probe_ran').touch()"
     )
     client = RecordedClient(
-        ChatResult(f"```explore\n{snippet}\n{closing_fence}", "length"),
+        ChatResult(f"```{language}\n{snippet}\n{closing_fence}", "length"),
+        "```python\nprint('complete_measurement=2.5')\n```",
         writer(2.5),
         "VERDICT: PASS",
     )
     solver = solver_for(tmp_path, client)
     assert solver.run()
     assert not (solver.task_dir / "partial_probe_ran").exists()
-    assert client.requests[1][1]["phase"] == "generate"
+    assert [kwargs["phase"] for _, kwargs in client.requests] == [
+        "probe",
+        "probe",
+        "generate",
+        "review",
+    ]
+    assert "complete_measurement=2.5" in client.requests[2][0]
 
 
 def test_repair_can_probe_without_losing_the_failure_or_previous_evidence(tmp_path, monkeypatch):
@@ -109,10 +140,11 @@ def test_repair_can_probe_without_losing_the_failure_or_previous_evidence(tmp_pa
     assert "raise ValueError('wrong_tail_convention')" in prompt
 
 
-def test_review_probe_reads_a_fresh_output_copy_and_resumes_review(tmp_path, monkeypatch):
+@pytest.mark.parametrize("language", ["python", "explore"])
+def test_review_probe_reads_a_fresh_output_copy_and_resumes_review(tmp_path, monkeypatch, language):
     monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
     review_probe = (
-        "```explore\nimport json, os, pathlib\n"
+        f"```{language}\nimport json, os, pathlib\n"
         "p = pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json'\n"
         "print('observed_price=', json.loads(p.read_text())['price'])\n"
         "p.write_text('{}')\n```"
@@ -126,6 +158,13 @@ def test_review_probe_reads_a_fresh_output_copy_and_resumes_review(tmp_path, mon
     assert "observed_price= 2.5" in prompt
     assert "SCRIPT STDOUT" in prompt
     assert price(tmp_path) == 2.5
+    assert [kwargs["phase"] for _, kwargs in client.requests] == [
+        "probe",
+        "generate",
+        "probe",
+        "review",
+    ]
+    assert client.systems[2] == loop.PROBE_SYSTEM_PROMPT
 
 
 def test_review_probe_assertion_evidence_drives_a_numerical_fix(tmp_path, monkeypatch):
@@ -155,6 +194,7 @@ def test_probe_cannot_become_a_solution_continuation(tmp_path, monkeypatch):
         ChatResult(partial, "length"),
         "```explore\nimport os, pathlib\n(pathlib.Path(os.environ['TASK_DIR']) / 'unexpected_probe').touch()\n```",
         "```python\n(out / 'r.json').write_text('{\"price\": 2.5}')\n```",
+        "```python\nprint('review_measurement=2.5')\n```",
         "VERDICT: PASS",
     )
     solver = solver_for(tmp_path, client)
@@ -162,6 +202,46 @@ def test_probe_cannot_become_a_solution_continuation(tmp_path, monkeypatch):
     assert price(tmp_path) == 2.5
     assert not (solver.task_dir / "unexpected_probe").exists()
     assert client.requests[3][1]["phase"] == "continue"
+
+
+@pytest.mark.parametrize("review_probe", [False, True])
+def test_incomplete_explicit_probe_recovers_once_then_resumes(tmp_path, monkeypatch, review_probe):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2 if review_probe else 1)
+    responses = (
+        ["```python\nprint('initial_measurement=2.5')\n```", writer(2.5)] if review_probe else []
+    )
+    responses.extend(
+        [ChatResult("```python\nprint('unfinished')\n```", "length"), "unfinished probe"]
+    )
+    responses.extend(["VERDICT: PASS"] if review_probe else [writer(2.5), "VERDICT: PASS"])
+    client = RecordedClient(*responses)
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    phases = [kwargs["phase"] for _, kwargs in client.requests]
+    assert phases == (
+        ["probe", "generate", "probe", "probe", "review"]
+        if review_probe
+        else ["probe", "probe", "generate", "review"]
+    )
+    assert "recovery budget is exhausted" in client.requests[-1 if review_probe else -2][0]
+    assert "[stdout]\nunfinished" not in client.requests[-1][0]
+
+
+def test_expired_explicit_review_probe_preserves_clean_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 2)
+    client = RecordedClient(
+        "```python\nprint('initial_measurement=2.5')\n```", writer(2.5), writer(999)
+    )
+    solver = solver_for(tmp_path, client)
+
+    def expire_after_probe_response(number):
+        if number == 3:
+            solver.deadline = time.monotonic() - 1
+
+    client.after_response = expire_after_probe_response
+    assert solver.run()
+    assert price(tmp_path) == 2.5
+    assert [kwargs["phase"] for _, kwargs in client.requests] == ["probe", "generate", "probe"]
 
 
 def test_probe_evidence_survives_context_window_fallback(tmp_path, monkeypatch):
@@ -239,7 +319,7 @@ class SpecTestClient(RecordedClient):
         if tests:
             self.tests_started.set()
             assert self.solution_started.wait(timeout=3), "test writing was sequential"
-        elif kwargs["phase"] == "generate":
+        elif kwargs["phase"] in {"generate", "probe"}:
             self.solution_started.set()
             assert self.tests_started.wait(timeout=3), "solution writing was sequential"
         return response if isinstance(response, ChatResult) else ChatResult(response, "stop")
@@ -267,6 +347,25 @@ def test_spec_first_tests_overlap_generation_and_recheck_a_frozen_suite(tmp_path
     repair = next(prompt for prompt, kwargs in client.requests if kwargs["phase"] == "repair")
     assert "price expected 2.5 got 1.5" in repair
     assert all("deadline" in kwargs for _, kwargs in client.requests)
+
+
+def test_spec_first_tests_can_overlap_an_explicit_initial_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "TESTS", True)
+    monkeypatch.setattr(loop, "EXPLORE_STEPS", 1)
+    client = SpecTestClient(
+        PRICE_TEST,
+        "```python\nprint('independent_price=2.5')\n```",
+        writer(1.5),
+        writer(2.5),
+        "VERDICT: PASS",
+    )
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.request_count == 5
+    assert sum(kwargs["phase"] == "probe" for _, kwargs in client.requests) == 1
+    test_prompt = next(prompt for prompt, kwargs in client.requests if kwargs["phase"] == "tests")
+    assert "independent_price" not in test_prompt
+    assert "EXPLORATION SO FAR" not in test_prompt
 
 
 @pytest.mark.parametrize(

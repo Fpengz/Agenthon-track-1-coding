@@ -159,8 +159,13 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   The two-run eight-unit pilot (`20261001-1056-probe-loop-*`, image `22c989c`) passed 2/1
   probes vs 2/2 control, with 8.1 vs 5.7 requests and 238 vs 191 s/unit. No initial probes were
   recognized: the model used Python fences, which the dispatcher treated as solution scripts.
-  Only four review probes executed across 16 probe-arm units. Fix explicit probe routing before
-  treating another run as an evaluation of the initial-probe idea.
+  Only four review probes executed across 16 probe-arm units. The corrected loop now schedules
+  a dedicated `probe` request before initial generation and before review when allowance and
+  follow-up budget remain. Its system prompt requests a compact diagnostic Python program;
+  Python replies route to the scratch runner, and the pending generation/review resumes with
+  observations. Ordinary requests also allow explicit `explore` blocks without a conflicting
+  Python-only system rule. Incomplete dedicated probes get one recovery, then resume the pending
+  operation. Control prompts remain unchanged. Repeat the matched pilot with this routing.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output

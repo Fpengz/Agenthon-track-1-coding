@@ -17,9 +17,9 @@ def _runtime_versions() -> str:
     return ", ".join(found)
 
 
-SYSTEM_PROMPT = """You are an expert Quantitative Finance Engineer and Python Developer participating in Agenthon 2026 / QFBench 2.0 Track 1.
+_SYSTEM_TEMPLATE = """You are an expert Quantitative Finance Engineer and Python Developer participating in Agenthon 2026 / QFBench 2.0 Track 1.
 
-Your objective is to write robust, bug-free, self-contained Python code that solves the quantitative finance task described in the prompt and outputs the required deliverable files.
+{objective}
 
 CRITICAL OPERATING RULES:
 1. Paths (IMPORTANT):
@@ -28,8 +28,7 @@ CRITICAL OPERATING RULES:
      `pathlib.Path(os.environ["TASK_DIR"]) / "<path relative to /input>"` and
      `pathlib.Path(os.environ["OUTPUT_DIR"]) / "<file name>"`. Never hard-code `/input` or `/output`.
    - The script runs from a scratch directory; do not rely on the current working directory.
-   - Write only the requested deliverables to OUTPUT_DIR. Do NOT write reward.json or
-     pytest_report.json (the test harness generates these offline).
+{output_rule}
 
 2. Input Files:
    - Input datasets live under TASK_DIR, typically in `environment/data/` or `data/`.
@@ -46,7 +45,12 @@ CRITICAL OPERATING RULES:
    - Network access is disabled. Do not try to download external packages or fetch online data.
    - Inspect the data previews in the prompt and use the exact column names and JSON keys shown.
 
-5. Response Budget and Formatting:
+{response_rules}""".replace("{versions}", _runtime_versions())
+
+_SOLUTION_OBJECTIVE = "Your objective is to write robust, bug-free, self-contained Python code that solves the quantitative finance task described in the prompt and outputs the required deliverable files."
+_SOLUTION_OUTPUT_RULE = """   - Write only the requested deliverables to OUTPUT_DIR. Do NOT write reward.json or
+     pytest_report.json (the test harness generates these offline)."""
+_SOLUTION_RESPONSE_RULES = """5. Response Budget and Formatting:
    - Your whole response (reasoning included) is capped at about 4,000 tokens. Keep reasoning
      short and spend the budget on the script. Keep the script compact (well under 200 lines),
      with few comments and no long docstrings.
@@ -54,13 +58,49 @@ CRITICAL OPERATING RULES:
      Put nothing after the closing fence.
    - Do NOT output partial snippets or placeholders. The code will be executed directly via Python.
    - Use only ASCII characters in the code (no unicode math symbols such as the partial sign or sigma).
-""".replace("{versions}", _runtime_versions())
+"""
+
+
+def _system_prompt(objective: str, output_rule: str, response_rules: str) -> str:
+    return (
+        _SYSTEM_TEMPLATE.replace("{objective}", objective)
+        .replace("{output_rule}", output_rule)
+        .replace("{response_rules}", response_rules)
+    )
+
+
+SYSTEM_PROMPT = _system_prompt(_SOLUTION_OBJECTIVE, _SOLUTION_OUTPUT_RULE, _SOLUTION_RESPONSE_RULES)
+TOOL_SYSTEM_PROMPT = _system_prompt(
+    _SOLUTION_OBJECTIVE,
+    _SOLUTION_OUTPUT_RULE,
+    _SOLUTION_RESPONSE_RULES.replace(
+        "Provide the complete, runnable Python script inside a single ```python ... ``` markdown block.",
+        "For a solution, provide its complete runnable script in ```python ... ```. To request "
+        "a local numerical probe first, provide only that standalone program in ```explore ... ```.",
+    ),
+)
+PROBE_SYSTEM_PROMPT = _system_prompt(
+    "Your current objective is to write one small executable numerical probe. Its measurements "
+    "will inform a later solution or review; this request does not produce the final solution.",
+    "   - OUTPUT_DIR is a fresh scratch copy of available deliverables. Read it when checking "
+    "outputs, and print observations to stdout. Final deliverables are written in a later phase.",
+    """5. Probe Budget and Formatting:
+   - Reply only with one complete runnable program inside ```python ... ```.
+   - Keep it under 60 lines and reasoning brief; the whole response is capped at 4,000 tokens.
+   - Start with a comment naming the numerical question and its expected invariant.
+   - Print compared values and their discrepancy. Use a tiny synthetic example or bounded data
+     sample for initial probes; independently recompute and read an actual value for output probes.
+   - Use ASCII code and installed local libraries. Put nothing after the closing fence.
+""",
+)
 
 
 _MAX_PATH_MAP_LINES = 40
 
 EXPLORE_INSTRUCTION = """5. Local numerical probes: up to {k} snippets across generation, repair and review.
-   Your FIRST reply must be ONLY one complete ```explore ... ``` Python block, under 60 lines.
+   The agent requests initial and output probes in a separate phase, using ```python``` replies.
+   In ordinary solution/repair/review requests, Python blocks are solutions or fixes; request
+   any additional numerical measurement with one standalone ```explore``` block under 60 lines.
    Start with a comment naming a numerical question from this task and its expected invariant.
    Test a formula, sign/scale convention, date alignment or library behaviour on a tiny synthetic
    example or a bounded input sample. Print the competing values and numerical discrepancy.
@@ -496,18 +536,32 @@ def build_probe_instruction(steps_left: int, phase: str) -> str:
             f"\nNo exploration left: finish the pending {phase} in its requested format "
             "(complete solution, repair edits, or review verdict)."
         )
-    if phase == "review":
-        return (
-            f"\nLOCAL NUMERICAL REVIEW: {steps_left} probes remaining. Before your verdict, "
-            "independently recompute one important requested value from the specification and "
-            "task inputs, read its actual deliverable value using OUTPUT_DIR, and print both "
-            "values and their discrepancy. Reply ONLY with one complete ```explore``` block "
-            "under 60 lines. OUTPUT_DIR is a fresh scratch copy. The measured results return "
-            "to this review; then give the verdict and any repair."
-        )
     return (
         f"\nLOCAL PROBE AVAILABLE: {steps_left} remaining. To measure a specific numerical "
         f"uncertainty before finishing this {phase}, reply ONLY with one complete ```explore``` "
         "block (under 60 lines). OUTPUT_DIR is a fresh scratch copy of current deliverables. "
         "Its results return to this same operation. Otherwise finish in the format requested above."
     )
+
+
+def build_probe_request(phase: str) -> str:
+    """An explicit request phase; Python replies are measurements, never solution scripts."""
+    question = (
+        "Independently recompute one important requested value from the specification and "
+        "task inputs. Read its actual deliverable value using OUTPUT_DIR and print both values "
+        "and their numerical discrepancy. The solution code is provisional; choose the "
+        "calculation from the specification."
+        if phase == "review"
+        else "Resolve one numerical uncertainty before implementing the solution: compare "
+        "formulas, sign/scale conventions, date alignment or library behaviour on a tiny "
+        "synthetic example or bounded input sample. Print the values and discrepancy; use "
+        "the supplied previews for schema information."
+    )
+    return f"""
+
+### CURRENT PHASE: NUMERICAL PROBE BEFORE {phase.upper()}
+The material above describes the pending {phase}; this request asks only for a diagnostic program.
+{question}
+OUTPUT_DIR is a fresh scratch copy of available outputs. Return one complete ```python``` program
+under 60 lines. Its stdout/errors return to the pending {phase} before a solution or verdict.
+"""
