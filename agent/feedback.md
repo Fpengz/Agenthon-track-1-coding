@@ -70,3 +70,11 @@ Inspect whether probes perform numerical computations and read outputs; a pass-r
 without those observations does not demonstrate that execution feedback helped. Record fixed
 denominator pass@1, request/runtime costs, and the phases in which probes executed. Launch long
 runs with `setsid nohup`; wait for prior cohorts to finish before adding model load.
+
+The completed eight-unit pilot (`20261001-1056-probe-loop-*`) passed 3/16 with probes versus
+4/16 for control. Its traces exposed an additional routing problem: all initial responses used
+Python fences, including short programs explicitly labelled as probes. The dispatcher handled
+them as solutions, so their observations did not enter the probe ledger. Only four review probes
+executed across the 16 probe-arm units. The system's Python-only response instruction conflicts
+with the user prompt's initial `explore` format. This pilot does not establish whether correctly
+routed initial numerical probes help; use an explicit probe request phase before repeating it.

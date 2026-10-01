@@ -156,7 +156,12 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   solution turn they inspected. Truncated probes never execute or become solution continuations.
   Exploration stays off until a matched A/B demonstrates a gain. See
   [agent/feedback.md](agent/feedback.md) for the diagnosed transition failures and regression loop.
-- Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B pending): one test-writing request overlaps
+  The two-run eight-unit pilot (`20261001-1056-probe-loop-*`, image `22c989c`) passed 2/1
+  probes vs 2/2 control, with 8.1 vs 5.7 requests and 238 vs 191 s/unit. No initial probes were
+  recognized: the model used Python fences, which the dispatcher treated as solution scripts.
+  Only four review probes executed across 16 probe-arm units. Fix explicit probe routing before
+  treating another run as an evaluation of the initial-probe idea.
+- Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
   previews. A complete suite is frozen and re-executed on fresh output copies after each clean
@@ -170,7 +175,10 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   consensus candidates. Record and forward this switch in all experiment/container runs.
   The revised eight-unit pilot (`20261001-0910-ability2-*`, two runs/arm, simultaneous)
   passed 3/3 with tests vs 2/2 control: 8.3 vs 7.4 requests and 274 vs 248 s/unit. This subset
-  signal is insufficient to change defaults; compare over the full 86-unit roster first.
+  was followed by the simultaneous full-roster comparison (`20261001-0937-full-tests-*`,
+  image `27e6cb3`, four runs at `-j 8`, 1000 s budget): tests passed 19/20 vs 18/17 control,
+  mean pass@1 0.227 vs 0.203, 8.75 vs 6.74 requests and 414 vs 360 s/unit. This is a modest
+  positive signal from two runs per arm; keep the default off until confirmed.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
   (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
   replaces the fixed review/verifier caps (up to 4 reviews / 3 verifier rounds while
