@@ -169,7 +169,7 @@ class HouseModelClient:
     ) -> ChatResult:
         """Send a completion request, retrying transient failures within the request budget.
 
-        ``phase`` (generate / repair / review / continue / judge / verify / plan) selects the
+        ``phase`` (generate / repair / review / continue / judge / verify / tests / plan) selects the
         reasoning effort in hybrid mode.
         ``deadline`` is an absolute ``time.monotonic()`` limit shared by a unit's requests.
         """

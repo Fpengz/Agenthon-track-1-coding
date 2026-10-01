@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from openai.types.chat import ChatCompletionMessageParam
@@ -42,6 +42,7 @@ from agent.prompts import (
     build_repair_prompt,
     build_review_prompt,
     build_review_retry_prompt,
+    build_spec_tests_prompt,
     build_verifier_repair_prompt,
     build_verify_prompt,
 )
@@ -96,6 +97,11 @@ EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true"
 # requirements checklist extracted up front. Both spend otherwise-unused requests on evidence
 # about correctness: 115 of 136 failing units ended "accepted but wrong".
 VERIFY = os.environ.get("AGENT_VERIFY", "0").strip().lower() in {"1", "true", "on"}
+# One independent test-writing request, overlapped with generation. The suite is frozen before
+# it sees any outputs and re-executed after repairs; unlike VERIFY, it never reads the solution.
+TESTS = os.environ.get("AGENT_TESTS", "0").strip().lower() in {"1", "true", "on"}
+SPEC_TEST_GENERATION_SEC = 120
+MAX_TEST_REPAIRS = 2
 MAX_VERIFY = 2
 VERIFY_TIMEOUT_SEC = 120
 PLAN = os.environ.get("AGENT_PLAN", "0").strip().lower() in {"1", "true", "on"}
@@ -455,13 +461,27 @@ class AgentSolver:
         with tempfile.TemporaryDirectory(prefix="agent-work-") as work_dir:
             if CANDIDATES > 1:
                 return self._solve_with_consensus(expected_deliverables, pathlib.Path(work_dir))
+            if TESTS and self._can_afford(3):
+                # Both calls use the same client's atomic request admission and unit deadline.
+                # Bound the background call so shutdown cannot consume the full unit budget.
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    test_future = pool.submit(
+                        self._generate_spec_tests,
+                        self._prompt_variants(self.out_dir, tests_only=True),
+                    )
+                    return self._solve_loop(
+                        prompt_variants=prompt_variants,
+                        expected_deliverables=expected_deliverables,
+                        work_dir=pathlib.Path(work_dir),
+                        test_future=test_future,
+                    )
             return self._solve_loop(
                 prompt_variants=prompt_variants,
                 expected_deliverables=expected_deliverables,
                 work_dir=pathlib.Path(work_dir),
             )
 
-    def _prompt_variants(self, out_dir: pathlib.Path) -> list[str]:
+    def _prompt_variants(self, out_dir: pathlib.Path, *, tests_only: bool = False) -> list[str]:
         """Task prompts from richest to leanest; the context guard falls back along this list."""
         parts = self._prompt_parts
         return [
@@ -471,11 +491,15 @@ class AgentSolver:
                 out_dir=str(out_dir),
                 discovered_files=parts.discovered_files,
                 path_map=parts.path_map,
-                structured=STRUCTURED,
+                structured=STRUCTURED and not tests_only,
                 task_facts=parts.task_facts,
                 skills_summary=skills_summary(parts.instruction_text) if SKILLS else "",
-                explore_steps=EXPLORE_STEPS,
-                **{k: v for k, v in parts.optional.items() if k not in dropped},
+                explore_steps=EXPLORE_STEPS if not tests_only else 0,
+                **{
+                    k: v
+                    for k, v in parts.optional.items()
+                    if k not in dropped and (not tests_only or k == "input_previews")
+                },
             )
             for dropped in _DROP_ORDER
         ]
@@ -488,6 +512,7 @@ class AgentSolver:
         temperature: float = 0.0,
         max_reviews: int = MAX_REVIEWS,
         max_attempts: int | None = None,
+        test_future: Future[str] | None = None,
     ) -> bool:
         """Generate, run and repair until a clean run is accepted; False if none was."""
         initial_prompt = prompt_variants[0]
@@ -514,6 +539,8 @@ class AgentSolver:
         explore_steps = 0
         exploration_log: list[tuple[str, str]] = []
         verify_code = ""  # the script a verifier-driven repair was asked about
+        test_code: str | None = None
+        test_repairs = 0
         loop_started = time.monotonic()
 
         # Iterative execution & self-repair loop
@@ -813,6 +840,37 @@ class AgentSolver:
                             "specification: required columns or keys are missing.",
                         )
                         continue
+                    if test_future is not None:
+                        if test_code is None:
+                            try:
+                                # Generation normally overlaps the first solution request/run.
+                                # Leave time for execution and a repair if it is still pending.
+                                test_code = test_future.result(
+                                    timeout=max(0, self._time_left() - 2 * MIN_ATTEMPT_SEC)
+                                )
+                            except TimeoutError:
+                                logger.warning("Spec-first tests unavailable within the budget")
+                                test_code = ""
+                        if test_code:
+                            report = self._run_spec_tests(test_code, work_dir, accepted_dir)
+                            if (
+                                report
+                                and test_repairs < MAX_TEST_REPAIRS
+                                and self._can_afford(1, accepted_seconds)
+                            ):
+                                test_repairs += 1
+                                continuations = 0
+                                edit_base = code
+                                verify_code = code
+                                user_prompt = build_repair_prompt(
+                                    edit_mode=_edit_mode(code),
+                                    task_prompt=initial_prompt,
+                                    previous_code=code,
+                                    error_message=report,
+                                    out_dir=str(self.out_dir),
+                                    headline=VERIFY_REPAIR_HEADLINE,
+                                )
+                                continue
                     verify_cap = ADAPTIVE_MAX_VERIFY if ADAPTIVE else MAX_VERIFY
                     verify_affordable = (
                         self._can_afford(3, accepted_seconds)
@@ -1012,6 +1070,72 @@ class AgentSolver:
         text = result.content.split("</think>")[-1].replace("```", "").strip()
         logger.info("Requirements checklist: %d lines", len(text.splitlines()))
         return text[:MAX_CHECKLIST_CHARS]
+
+    def _generate_spec_tests(self, variants: list[str]) -> str:
+        """Generate one frozen suite using only the original task prompt."""
+        task_prompt = variants[0]
+        fitted = fit_to_context(build_spec_tests_prompt(task_prompt), task_prompt, variants)
+        if fitted is None:
+            logger.warning("Spec-first test prompt exceeds the context limit")
+            return ""
+        try:
+            result = self.client.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": fitted[0]},
+                ],
+                temperature=0.0,
+                max_tokens=fitted[2],
+                phase="tests",
+                deadline=min(
+                    self.deadline - MIN_EXEC_TIMEOUT_SEC - 10,
+                    time.monotonic() + SPEC_TEST_GENERATION_SEC,
+                ),
+            )
+            code = extract_python_code(result.content)
+            if result.truncated or not code:
+                logger.warning("Spec-first test generation incomplete; using normal review")
+                return ""
+            compile(code, "<spec-first-tests>", "exec")
+            logger.info("Spec-first tests generated (%d lines)", len(code.splitlines()))
+            transcript_dir = os.environ.get("AGENT_TRANSCRIPT_DIR")
+            if transcript_dir:
+                pathlib.Path(transcript_dir).mkdir(parents=True, exist_ok=True)
+                (pathlib.Path(transcript_dir) / "spec_tests.py").write_text(code, encoding="utf-8")
+            return code
+        except Exception:
+            logger.exception("Spec-first test generation failed; using normal review")
+            return ""
+
+    def _run_spec_tests(self, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path) -> str:
+        """Execute the unchanged suite on a fresh output copy, returning only proven failures."""
+        timeout = self._execution_timeout(VERIFY_TIMEOUT_SEC, reserve=MIN_ATTEMPT_SEC)
+        if timeout is None:
+            logger.warning("Spec-first tests skipped: insufficient execution time")
+            return ""
+        copy_dir = work_dir / "spec-test-outputs"
+        if copy_dir.exists():
+            shutil.rmtree(copy_dir)
+        shutil.copytree(accepted_dir, copy_dir)
+        run = run_code(
+            code,
+            work_dir / "spec-tests",
+            copy_dir,
+            task_dir=self.task_dir,
+            timeout_sec=timeout,
+        )
+        evidence = verifier_result(run)
+        logger.info(
+            "Spec-first tests: %d PASS, %d FAIL (returncode=%d)",
+            evidence.passes,
+            len(evidence.failures),
+            run.returncode,
+        )
+        if evidence.failures:
+            return "Spec-first test failures:\n" + "\n".join(evidence.failures[:20])[:6500]
+        if evidence.incomplete:
+            logger.warning("Spec-first tests incomplete: %s", evidence.incomplete[:200])
+        return ""
 
     def _run_verifier(
         self, task_prompt: str, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path

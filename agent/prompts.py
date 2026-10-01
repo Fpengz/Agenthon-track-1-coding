@@ -391,6 +391,35 @@ execution rather than by reading.
 """
 
 
+def build_spec_tests_prompt(task_prompt: str) -> str:
+    """Write tests before the solution exists, with no solution or output context."""
+    return f"""{task_prompt}
+
+---
+Your role for this request is TEST AUTHOR. Another request independently writes the solution.
+Write a standalone Python test program derived ONLY from the TASK SPECIFICATION and supplied
+input information above. The solution and its outputs are unavailable to you.
+
+### SPEC-FIRST TEST REQUIREMENTS:
+1. Read the original inputs from TASK_DIR and future deliverables from OUTPUT_DIR, using the
+   environment variables. Resolve the input paths using the mapping above. Treat all files as
+   read-only. Return tests, rather than a program that writes deliverables.
+2. Independently compute 2-4 representative numerical results from the supplied input files.
+   Use the specification's exact formulas, filters, timing, units and conventions. Check values
+   by their stated row identifiers or keys. Prefer small direct calculations over implementing
+   the entire solution. If agent_skills helpers are listed, use them where conventions match.
+3. Also check explicitly required schema and financial invariants. Test only requirements the
+   specification establishes. Where a numerical convention is ambiguous, test a stated
+   invariant instead of inventing an exact expected value. Use sensible numerical tolerances;
+   stochastic estimates need sampling error tolerances, not equality to one seeded draw.
+4. Print a nonempty PASS: or FAIL: line for every executed check. A failure must include the
+   requirement, expected value and actual value. Catch assertion failures separately so the
+   remaining checks run. Exit 1 if any check fails and 0 otherwise. Print PASS only after
+   executing a comparison. Missing required files or fields are failures.
+5. Keep reasoning brief and the program compact. Return one complete ```python ... ``` block.
+"""
+
+
 def build_verifier_repair_prompt(verifier_prompt: str, verifier: str, feedback: str) -> str:
     """Repair the verification program rather than an untested solution."""
     return f"""{verifier_prompt}

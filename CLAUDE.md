@@ -117,13 +117,18 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   function per deliverable; 0.163), `AGENT_CANDIDATES` (consensus; same gain as low reasoning at
   12.7 requests / 521 s per unit, over the roster budget), `AGENT_DOMAIN_NOTES` (0.140 vs 0.157).
   Results per run are in `experiments/registry.jsonl`.
-- Methods that spend the unused request budget (all default off; A/B pending):
+- Methods that spend the unused request budget (all default off):
   `HOUSE_REASONING=hybrid` (low effort for generation, off for review/repair/continuation; the
   not-honoured detector only judges generation replies), `AGENT_VERIFY=1` (model-written
   verifier executed on a fresh COPY of the outputs; `FAIL:` lines and failed assertions drive
   a solution repair. A crashed, silent or truncated verifier gets one recovery request when
   affordable; persistent incompleteness falls back to normal review. The model may return its
-  solution unchanged to reject a faulty verifier; <= 2 rounds), `AGENT_PLAN=1` (one request
+  solution unchanged to reject a faulty verifier; <= 2 rounds). The simultaneous three-run
+  comparison (`20261001-0142-n-*`, image `9681fbf`, `-j 8`, 1000 s budget) passed 22/17/18
+  control vs 21/19/18 verifier: mean pass@1 0.221 vs 0.225, 6.9 vs 9.0 requests and 434 vs
+  527 s/unit. Both arms passed 26 units at least once; the verifier improved 9 units and
+  regressed 10. Keep verification off: the earlier v2 gain used lighter server load.
+  `AGENT_PLAN=1` (one request
   extracts a requirements checklist into every prompt), `AGENT_EXPLORE=K` (tool use: up to K
   ```explore snippets run read-only with output fed back before the final script),
   `AGENT_SKILLS=1` (advertise `agent_skills`, from `skills.py`, copied next to every script).
@@ -138,12 +143,21 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   each convention from the task instruction. Existing helper defaults remain compatible.
   A/B pending. Exploration (`AGENT_EXPLORE`) was used in half the units but 161 of 164 snippets
   only re-read what the input previews already show; it stays off.
+- Spec-first tests (`AGENT_TESTS=1`, default off; A/B pending): one test-writing request overlaps
+  solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
+  contains the original specification and input information, never the solution or output
+  previews. A complete suite is frozen and re-executed on fresh output copies after each clean
+  run; executed assertions or FAIL lines can drive up to two repairs. Incomplete/truncated suites
+  or test-program crashes fall back to normal review. The solution can reject a faulty test by
+  returning its script unchanged. Generation is capped at 120 s; tests are not used with
+  consensus candidates. Record and forward this switch in all experiment/container runs.
 - Adaptive evidence budget (`AGENT_ADAPTIVE=1`, default off): the client tracks request latency
   (p75 of the last 8; prior `HOUSE_LATENCY_PRIOR_SEC`, default 45), and `_can_afford(n)`
   replaces the fixed review/verifier caps (up to 4 reviews / 3 verifier rounds while
   "requests left and time left > n x latency + run time + margin"). Local latency (~22 s single
   stream, ~43 s under A/B load) overstates the House route's, so A/B time figures are upper
-  bounds; the real latency is in any Development upload's logs (`completed in X s`).
+  bounds; the real latency is in any Development upload's logs (`completed in X s`). Keep it
+  off: three adaptive runs passed 16/20/21, with no reliable gain and higher request cost.
 - `review.py` — self-verification. Exit 0 + present files says nothing about correctness and the
   checker is sealed, so a clean run is not accepted immediately: the loop snapshots the outputs,
   computes mechanical findings (NaN/inf, empty tables, JSON nulls) and sends a review prompt

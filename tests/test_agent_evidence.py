@@ -1,6 +1,7 @@
 """Regression tests for the agent's review, verification and output fallback paths."""
 
 import json
+import threading
 import time
 
 import pytest
@@ -40,7 +41,7 @@ class RecordedClient:
 
 @pytest.fixture(autouse=True)
 def default_policy(monkeypatch):
-    for name in ("VERIFY", "PLAN", "SKILLS", "ADAPTIVE", "SPEC_CHECKS", "EXAMPLES"):
+    for name in ("VERIFY", "TESTS", "PLAN", "SKILLS", "ADAPTIVE", "SPEC_CHECKS", "EXAMPLES"):
         monkeypatch.setattr(loop, name, False)
     monkeypatch.setattr(loop, "CANDIDATES", 1)
     monkeypatch.setattr(loop, "EXPLORE_STEPS", 0)
@@ -55,6 +56,112 @@ def solver_for(tmp_path, client):
 
 def price(tmp_path):
     return json.loads((tmp_path / "out" / "r.json").read_text())["price"]
+
+
+class SpecTestClient(RecordedClient):
+    """Synchronise the two initial calls to prove generation overlaps test writing."""
+
+    def __init__(self, test_response, *responses):
+        super().__init__(*responses)
+        self.test_response = test_response
+        self.tests_started = threading.Event()
+        self.solution_started = threading.Event()
+        self.lock = threading.Lock()
+
+    def chat(self, messages, **kwargs):
+        with self.lock:
+            self.request_count += 1
+            self.requests.append((messages[-1]["content"], kwargs))
+            tests = kwargs["phase"] == "tests"
+            response = self.test_response if tests else self.responses.pop(0)
+        if tests:
+            self.tests_started.set()
+            assert self.solution_started.wait(timeout=3), "test writing was sequential"
+        elif kwargs["phase"] == "generate":
+            self.solution_started.set()
+            assert self.tests_started.wait(timeout=3), "solution writing was sequential"
+        return response if isinstance(response, ChatResult) else ChatResult(response, "stop")
+
+
+PRICE_TEST = (
+    "```python\nimport json, os, pathlib\n"
+    "value = json.loads((pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').read_text())['price']\n"
+    "assert value == 2.5, f'price expected 2.5 got {value}'\n"
+    "print('PASS: price')\n```"
+)
+
+
+def test_spec_first_tests_overlap_generation_and_recheck_a_frozen_suite(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "TESTS", True)
+    client = SpecTestClient(PRICE_TEST, writer(1.5), writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.request_count == 4
+    test_requests = [prompt for prompt, kwargs in client.requests if kwargs["phase"] == "tests"]
+    assert len(test_requests) == 1
+    assert "TEST AUTHOR" in test_requests[0]
+    assert "1.5" not in test_requests[0]
+    assert "SCRIPT THAT PRODUCED" not in test_requests[0]
+    repair = next(prompt for prompt, kwargs in client.requests if kwargs["phase"] == "repair")
+    assert "price expected 2.5 got 1.5" in repair
+    assert all("deadline" in kwargs for _, kwargs in client.requests)
+
+
+@pytest.mark.parametrize(
+    "suite",
+    [
+        "```python\nraise KeyError('test_bug')\n```",
+        "```python\npass\n```",
+        ChatResult("```python\nassert False\n```", "length"),
+        "Incomplete test reasoning, no script",
+    ],
+)
+def test_incomplete_spec_first_tests_fall_back_to_review(tmp_path, monkeypatch, suite):
+    monkeypatch.setattr(loop, "TESTS", True)
+    client = SpecTestClient(suite, writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.request_count == 3
+    assert not any(kwargs["phase"] == "repair" for _, kwargs in client.requests)
+
+
+def test_spec_first_tests_cannot_corrupt_the_deliverables(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "TESTS", True)
+    modifies_copy = (
+        "```python\nimport os, pathlib\n"
+        "(pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').write_text('{}')\n"
+        "raise KeyError('test_bug')\n```"
+    )
+    client = SpecTestClient(modifies_copy, writer(2.5), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+
+
+def test_solution_can_reject_an_incorrect_spec_first_test(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "TESTS", True)
+    client = SpecTestClient(
+        "```python\nassert False, 'bad assumption'\n```", writer(2.5), writer(2.5)
+    )
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.5
+    assert client.request_count == 3
+
+
+def test_spec_first_test_repairs_are_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "TESTS", True)
+    client = SpecTestClient(PRICE_TEST, writer(1.5), writer(1.75), writer(2.0), "VERDICT: PASS")
+    assert solver_for(tmp_path, client).run()
+    assert price(tmp_path) == 2.0
+    assert sum(kwargs["phase"] == "tests" for _, kwargs in client.requests) == 1
+    assert sum(kwargs["phase"] == "repair" for _, kwargs in client.requests) == 2
+
+
+def test_spec_first_test_setting_is_recorded_and_forwarded():
+    from agent.batch import AGENT_ENV_VARS
+    from agent.experiments import SETTING_VARS
+
+    assert "AGENT_TESTS" in AGENT_ENV_VARS
+    assert "AGENT_TESTS" in SETTING_VARS
 
 
 def test_reasoning_draft_is_not_a_final_script():
