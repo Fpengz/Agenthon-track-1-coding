@@ -4,6 +4,8 @@ import pathlib
 import re
 import tempfile
 
+import pytest
+
 from agent.client import ChatResult
 from agent.executor import (
     apply_edits,
@@ -15,6 +17,15 @@ from agent.executor import (
 from agent.inputs import build_input_previews
 from agent.loop import AgentSolver, container_path_map
 from agent.review import output_diagnostics, parse_verdict
+
+
+@pytest.fixture(autouse=True)
+def single_candidate(monkeypatch):
+    """Most tests script one solver's replies; consensus tests opt in via ``_consensus``."""
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CANDIDATES", 1)
+    monkeypatch.setattr(loop, "CONSENSUS_EXTRA", 0)
 
 
 def test_extract_python_code():
@@ -612,7 +623,7 @@ class RoutedClient:
         self.lock = threading.Lock()
 
     def chat(self, messages, **kwargs):
-        match = re.search(r"out-([A-E])\b", messages[-1]["content"])
+        match = re.search(r"out-([A-H])\b", messages[-1]["content"])
         key = match.group(1) if match else "judge"
         with self.lock:
             self.request_count += 1
@@ -1014,3 +1025,31 @@ def test_skills_summary_lists_only_relevant_families():
     bonds = skills_summary("Compute modified duration and convexity of each coupon bond.")
     assert "bond_duration_convexity" in bonds and "bs_price" not in bonds
     assert "gbm_paths" not in skills_summary("Clean the filings table.")
+
+
+def test_second_round_runs_only_without_an_agreeing_pair(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CONSENSUS_EXTRA", 2)
+    solver, client = _consensus(
+        tmp_path, monkeypatch, 3,
+        A=[_writer(1.0), "VERDICT: PASS"], B=[_writer(2.0)], C=[_writer(3.0)],
+        D=[_writer(2.0)], E=[_writer(2.0)],
+    )  # fmt: skip
+    assert solver.run()
+    assert '"price": 2.0' in _out(tmp_path)  # the second round formed a majority
+    assert not client.queues.get("D") and not client.queues.get("E")
+
+
+def test_second_round_skipped_when_the_first_agrees(tmp_path, monkeypatch):
+    from agent import loop
+
+    monkeypatch.setattr(loop, "CONSENSUS_EXTRA", 2)
+    solver, client = _consensus(
+        tmp_path, monkeypatch, 3,
+        A=[_writer(1.5), "VERDICT: PASS"], B=[_writer(1.5)], C=[_writer(1.5)],
+        D=[_writer(9.0)], E=[_writer(9.0)],
+    )  # fmt: skip
+    assert solver.run()
+    assert "1.5" in _out(tmp_path)
+    assert len(client.queues["D"]) == 1 and len(client.queues["E"]) == 1

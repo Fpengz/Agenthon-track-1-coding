@@ -82,14 +82,22 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   part is first trimmed to its last complete logical line via `tokenize`, otherwise a cut inside
   a multi-line bracket makes the continuation restart it and leaves it unclosed); a
   response cut off before any code is handed back as "previous analysis".
-- `consensus.py` + `_solve_with_consensus` (`loop.py`) — best-of-N, `AGENT_CANDIDATES` (default 1
-  = off). Candidates run IN PARALLEL as child `AgentSolver`s sharing the client (request
+- `consensus.py` + `_solve_with_consensus` (`loop.py`) — best-of-N, `AGENT_CANDIDATES` (default **3**;
+  1 = single loop). Candidates run IN PARALLEL as child `AgentSolver`s sharing the client (request
   admission is atomic), budget, deadline and prompt parts; each writes to its own staging
   OUTPUT_DIR. A is the regular loop (greedy, with review); B, C... are sampled (0.7), unreviewed,
   <= 6 attempts. The first agreeing pair (>= 0.95) sets a stop event; otherwise 3+ clean
   candidates submit the medoid and 2 use a judge request. Why parallel: the budget, not time, is
   what goes unused (failing units used 7.7 of 25 requests; 115 of 136 ended "accepted but
   wrong"), and the sequential version cost 521 s per unit, over the roster allowance.
+  Adopted after a paired A/B (`cs-off`/`cs-on`, 3 pairs at -j 3 each, guardrails on): 0.248 vs
+  0.225 pass@1 (21.3 vs 19.3 per run; 12 units better, 4 worse), 13 vs 7.3 requests per unit,
+  same time (~350 s/unit, ~8.5 h roster at that load). Fewer missing/invalid outputs; wrong
+  numbers unchanged (all candidates share the misreading). Agreement predicts correctness (258
+  unit runs): all agree 69% pass, one agreeing pair 50%, partial 26%, max < 0.5 2%, one or no
+  clean candidate 0%. `AGENT_CONSENSUS_EXTRA=N` (default 0, A/B pending) runs a second round
+  of N more candidates when the first has no agreeing pair and >= 40% of the time budget and
+  >= 4 requests remain.
 - `spec.py` — `AGENT_SPEC_CHECKS` (default off): parsed from the instruction (headings, column
   tables, bold-bullet paragraphs, `Columns:` sentences, JSON examples with `<float>` placeholders;
   quoted placeholder KEYS like `"<sector>"` are dynamic and never required): required columns /
@@ -114,8 +122,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   to repeat the previous error. Repair prompts start with `Failure type: ...`.
 - Experimental switches, all OFF (A/B-tested, not adopted; code kept): `AGENT_SPEC_CHECKS`
   (0.157-0.180 vs control), `AGENT_EXAMPLES` (few-shot library; 0.157), `AGENT_STRUCTURED` (one
-  function per deliverable; 0.163), `AGENT_CANDIDATES` (consensus; same gain as low reasoning at
-  12.7 requests / 521 s per unit, over the roster budget), `AGENT_DOMAIN_NOTES` (0.140 vs 0.157).
+  function per deliverable; 0.163), `AGENT_DOMAIN_NOTES` (0.140 vs 0.157), `AGENT_VERIFY`
+  (paired A/B 0.225 vs 0.221), `AGENT_RED_FLAGS` (0.244 vs 0.240), `AGENT_SKILLS` v2 (0.213 vs
+  0.233).
   Results per run are in `experiments/registry.jsonl`.
 - Methods that spend the unused request budget (all default off):
   `HOUSE_REASONING=hybrid` (low effort for generation, off for review/repair/continuation; the
@@ -190,7 +199,7 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   0.500, and 0.438; requests/unit were 5.69, 7.75, and 9.06; seconds/unit were 336, 438,
   and 432. This small pilot supports full-roster confirmation of safeguards alone; it does
   not establish a roster gain or justify adding probes. Keep defaults unchanged.
-- Red flags (`AGENT_RED_FLAGS=1`, default off, A/B pending; `red_flags.py`): wrong numbers
+- Red flags (`AGENT_RED_FLAGS=1`, default off; A/B 0.244 vs 0.240, no gain; `red_flags.py`): wrong numbers
   are the main failure, and two kinds are visible in the outputs themselves -- a validation
   flag the task asked for reported `false`/`FAIL` (`mc_validates`, `parity_holds`,
   `all_checks_passed`; data properties such as `feller_satisfied` are not matched), and an
@@ -198,7 +207,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   names such as delta/pnl/change are skipped). Over 109 recorded runs they flag 550
   checker-failed vs 9 checker-passed unit runs (all 9 `mc_validates`). Findings join the
   guardrail findings (bounded repairs, keep the version with fewer findings), and the
-  generation prompt gets a short SELF-CHECKS section.
+  generation prompt gets a short SELF-CHECKS section. In the A/B the flags fired on the
+  predicted units but repairs rarely fixed the cause (16 fired, 5 cleared, 1 passed): the
+  model patches around the misconception that produced the bug.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output

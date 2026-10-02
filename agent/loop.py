@@ -91,14 +91,21 @@ DEFAULT_CARD_TIMEOUT_SEC = 1800.0
 MIN_ATTEMPT_SEC = 60.0  # do not start an attempt (request + run) with less time than this
 MIN_EXEC_TIMEOUT_SEC = 30
 # Best-of-N consensus (agent/consensus.py). AGENT_CANDIDATES=1 keeps the single-candidate loop.
-# With more, candidate A (the full loop, with review) runs first, leaving a small reserve of the
-# time budget; later candidates are independent solves (fresh prompt, sampled, no review, few
-# attempts) into their own staging directory. A near-identical pair ends the search early;
-# otherwise, with 3+ candidates the medoid (highest total agreement with the others) is
-# submitted, and with 2 a judge request decides. Independent solutions rarely agree exactly
-# (smoke run: pairwise agreement 0.40-0.91), so the medoid uses partial agreement as evidence.
-CANDIDATES = max(1, int(os.environ.get("AGENT_CANDIDATES", "1")))
-CANDIDATE_RESERVE_SHARE = 0.3
+# With more, candidates run in parallel: candidate A (the full loop, with review) and later
+# candidates (fresh prompt, sampled, no review, few attempts) solve independently into their own
+# staging directory. A near-identical pair ends the search early; otherwise, with 3+ candidates
+# the medoid (highest total agreement with the others) is submitted, and with 2 a judge request
+# decides. Independent solutions rarely agree exactly (smoke run: pairwise agreement 0.40-0.91),
+# so the medoid uses partial agreement as evidence.
+# Default 3: +2 units/run over the single loop in a 3-pair A/B (0.248 vs 0.225, 12 units better,
+# 4 worse) at ~13 of 25 requests and no extra time.
+CANDIDATES = max(1, int(os.environ.get("AGENT_CANDIDATES", "3")))
+# Extra candidates for a second round when the first shows no agreeing pair (off until A/B'd).
+# Agreement predicts correctness: all agree 69% pass, a pair 50%, partial 26%, max < 0.5 2%,
+# one clean candidate 0%, none 0% (258 consensus unit runs).
+CONSENSUS_EXTRA = max(0, int(os.environ.get("AGENT_CONSENSUS_EXTRA", "0")))
+EXTRA_MIN_TIME_SHARE = 0.4  # start the second round only with this share of the budget left
+EXTRA_MIN_REQUESTS = 4
 # Instruction-derived output checks (agent/spec.py): missing columns / JSON keys after a clean
 # run trigger up to MAX_SPEC_REPAIRS repair turns. Off by default until A/B-tested.
 SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", "true", "on"}
@@ -148,10 +155,9 @@ STRUCTURED = os.environ.get("AGENT_STRUCTURED", "0").strip().lower() in {
     "1",
     "true",
     "on",
-}  # at most this share of the budget is held back from candidate A
+}
 CANDIDATE_ATTEMPTS = 6
 CANDIDATE_TEMPERATURE = 0.7
-CANDIDATE_MIN_SEC = 120.0
 _CHOICE = re.compile(r"CHOICE:\s*\**\s*([AB])\b")
 # Repairs/reviews of scripts at least this long ask for SEARCH/REPLACE edits, not a rewrite.
 EDIT_MODE_MIN_LINES = 80
@@ -1724,30 +1730,54 @@ class AgentSolver:
         candidates side by side spends requests, not wall-clock time. The first agreeing pair
         stops the rest; otherwise the medoid (3+ clean) or a judge (2 clean) decides.
         """
-        labels: list[str] = list("ABCDE"[:CANDIDATES])
-        children: dict[str, AgentSolver] = {label: self._child(label, work_dir) for label in labels}
+        labels: list[str] = list("ABCDEFGH"[:CANDIDATES])
+        children: dict[str, AgentSolver] = {}
         clean: list[str] = []
         agreement: dict[tuple[str, str], float] = {}
         decided: str | None = None
-        with ThreadPoolExecutor(max_workers=len(labels)) as pool:
-            futures = {
-                pool.submit(self._run_child, label, child, expected, work_dir): label
-                for label, child in children.items()
-            }
-            for future in as_completed(futures):
-                label = futures[future]
-                if not future.result():
-                    logger.info("Consensus: candidate %s produced no clean run", label)
-                    continue
-                for earlier in clean:
-                    pair = (earlier, label) if earlier < label else (label, earlier)
-                    result = compare_outputs(children[pair[0]].out_dir, children[pair[1]].out_dir)
-                    agreement[pair] = result.score
-                    logger.info("Consensus: %s vs %s agreement %.3f", *pair, result.score)
-                    if result.agree and decided is None:
-                        decided = pair[0]
-                        self.stop_event.set()  # the others stop at their next attempt
-                clean.append(label)
+
+        def run_round(round_labels: list[str]) -> None:
+            nonlocal decided
+            for label in round_labels:
+                children[label] = self._child(label, work_dir)
+            with ThreadPoolExecutor(max_workers=len(round_labels)) as pool:
+                futures = {
+                    pool.submit(self._run_child, label, children[label], expected, work_dir): label
+                    for label in round_labels
+                }
+                for future in as_completed(futures):
+                    label = futures[future]
+                    if not future.result():
+                        logger.info("Consensus: candidate %s produced no clean run", label)
+                        continue
+                    for earlier in clean:
+                        pair = (earlier, label) if earlier < label else (label, earlier)
+                        result = compare_outputs(
+                            children[pair[0]].out_dir, children[pair[1]].out_dir
+                        )
+                        agreement[pair] = result.score
+                        logger.info("Consensus: %s vs %s agreement %.3f", *pair, result.score)
+                        if result.agree and decided is None:
+                            decided = pair[0]
+                            self.stop_event.set()  # the others stop at their next attempt
+                    clean.append(label)
+
+        run_round(labels)
+        if (
+            decided is None
+            and CONSENSUS_EXTRA
+            and self._time_left() >= EXTRA_MIN_TIME_SHARE * self.time_budget
+            and self._requests_left() >= EXTRA_MIN_REQUESTS
+        ):
+            extra = list("ABCDEFGH"[CANDIDATES : CANDIDATES + CONSENSUS_EXTRA])
+            logger.info(
+                "Consensus: no agreeing pair among %s; second round %s (%d requests, %.0f s left)",
+                clean,
+                extra,
+                self._requests_left(),
+                self._time_left(),
+            )
+            run_round(extra)
 
         clean.sort()
         if decided is None and len(clean) >= 3:
