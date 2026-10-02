@@ -56,6 +56,7 @@ from agent.prompts import (
     build_verifier_repair_prompt,
     build_verify_prompt,
 )
+from agent.red_flags import RED_FLAGS_GUIDANCE, red_flags
 from agent.review import (
     output_diagnostics,
     output_files,
@@ -104,6 +105,9 @@ SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", 
 MAX_SPEC_REPAIRS = 2
 GUARDRAILS = os.environ.get("AGENT_GUARDRAILS", "0").strip().lower() in {"1", "true", "on"}
 MAX_GUARD_REPAIRS = 3
+# Failed self-check flags and impossible values (negative prices/probabilities/vols) in a clean
+# run's outputs (agent/red_flags.py) join the guardrail findings above. Off until A/B-tested.
+RED_FLAGS = os.environ.get("AGENT_RED_FLAGS", "0").strip().lower() in {"1", "true", "on"}
 # Few-shot reference examples from agent/examples/library.jsonl (rule 8: OTHER units only).
 EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true", "on"}
 # Model-written verification tests (executed on a COPY of the outputs) after a clean run, and a
@@ -517,8 +521,11 @@ class AgentSolver:
                 task_facts=parts.task_facts,
                 skills_summary=skills_summary(parts.instruction_text) if SKILLS else "",
                 explore_steps=EXPLORE_STEPS if not tests_only else 0,
-                validation_guidance=self.guardrails.guidance
-                if self.guardrails and not tests_only
+                validation_guidance=(
+                    (self.guardrails.guidance if self.guardrails else "")
+                    + (f"\n{RED_FLAGS_GUIDANCE}" if RED_FLAGS else "")
+                ).strip()
+                if not tests_only
                 else "",
                 **{
                     k: v
@@ -1125,6 +1132,8 @@ class AgentSolver:
                     guard_problems = (
                         self.guardrails.findings(self.out_dir) if self.guardrails else []
                     )
+                    if RED_FLAGS:
+                        guard_problems.extend(red_flags(self.out_dir))
                     if REPAIR_V2 and frozen_audit:
                         report = self._run_spec_tests(frozen_audit, work_dir, self.out_dir)
                         if report:

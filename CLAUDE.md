@@ -190,6 +190,15 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   0.500, and 0.438; requests/unit were 5.69, 7.75, and 9.06; seconds/unit were 336, 438,
   and 432. This small pilot supports full-roster confirmation of safeguards alone; it does
   not establish a roster gain or justify adding probes. Keep defaults unchanged.
+- Red flags (`AGENT_RED_FLAGS=1`, default off, A/B pending; `red_flags.py`): wrong numbers
+  are the main failure, and two kinds are visible in the outputs themselves -- a validation
+  flag the task asked for reported `false`/`FAIL` (`mc_validates`, `parity_holds`,
+  `all_checks_passed`; data properties such as `feller_satisfied` are not matched), and an
+  impossible value (negative price/probability/volatility/variance, probability > 1; signed
+  names such as delta/pnl/change are skipped). Over 109 recorded runs they flag 550
+  checker-failed vs 9 checker-passed unit runs (all 9 `mc_validates`). Findings join the
+  guardrail findings (bounded repairs, keep the version with fewer findings), and the
+  generation prompt gets a short SELF-CHECKS section.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
