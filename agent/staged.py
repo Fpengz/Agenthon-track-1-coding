@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 
 MIN_STEPS = 2
 MAX_STEPS = 8
+MAX_DELIVERABLES_PER_STEP = 2  # the model ignores this limit in its plans, so it is enforced
+MAX_SPLIT_STEPS = 12
 STAGE_ENV = "STAGE_DIR"
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.S)
 
@@ -95,8 +97,36 @@ def parse_plan(text: str, deliverables: list[str]) -> list[Step] | None:
         steps[-1].writes += [
             f"OUTPUT_DIR/{d}" for d in deliverables if d.rsplit("/", 1)[-1] not in written
         ]
-        return steps
+        steps = split_large_steps(steps)
+        return steps if len(steps) <= MAX_SPLIT_STEPS else None
     return None
+
+
+def split_large_steps(steps: list[Step]) -> list[Step]:
+    """Split steps that write more than two deliverables (one such 5-deliverable step overran
+    the 4,000-token cap on every reply, even without thinking). Intermediate files stay with
+    the first part; each later part reads them like any later step."""
+    result: list[Step] = []
+    for step in steps:
+        outputs = [w for w in step.writes if w.upper().startswith("OUTPUT_DIR/")]
+        if len(outputs) <= MAX_DELIVERABLES_PER_STEP:
+            result.append(step)
+            continue
+        others = [w for w in step.writes if w not in outputs]
+        chunks = [
+            outputs[i : i + MAX_DELIVERABLES_PER_STEP]
+            for i in range(0, len(outputs), MAX_DELIVERABLES_PER_STEP)
+        ]
+        for part, chunk in enumerate(chunks, 1):
+            names = ", ".join(c.split("/", 1)[1] for c in chunk)
+            result.append(
+                Step(
+                    f"{step.name}_{part}",
+                    f"{step.goal} -- PART {part} of {len(chunks)}: write only {names}",
+                    (others if part == 1 else []) + chunk,
+                )
+            )
+    return result
 
 
 def build_step_prompt(

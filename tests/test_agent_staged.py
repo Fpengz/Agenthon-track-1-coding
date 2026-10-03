@@ -142,3 +142,43 @@ def test_plan_allows_up_to_eight_small_steps():
     steps = [{"name": f"s{i}", "goal": "g"} for i in range(8)]
     assert len(staged.parse_plan(plan(*steps), ["r.json"])) == 8
     assert staged.parse_plan(plan(*steps, {"name": "s9"}), ["r.json"]) is None
+
+
+def test_steps_with_many_deliverables_are_split():
+    text = plan(
+        {"name": "a", "goal": "load", "writes": ["STAGE_DIR/x.csv"]},
+        {
+            "name": "b",
+            "goal": "snapshot",
+            "writes": ["STAGE_DIR/y.csv"] + [f"OUTPUT_DIR/f{i}.json" for i in range(5)],
+        },
+    )
+    steps = staged.parse_plan(text, [f"f{i}.json" for i in range(5)])
+    assert [s.name for s in steps] == ["a", "b_1", "b_2", "b_3"]
+    assert steps[1].writes == ["STAGE_DIR/y.csv", "OUTPUT_DIR/f0.json", "OUTPUT_DIR/f1.json"]
+    assert steps[3].writes == ["OUTPUT_DIR/f4.json"]
+    assert "PART 3 of 3: write only f4.json" in steps[3].goal
+
+
+def test_step_cut_off_mid_script_is_continued(tmp_path, monkeypatch):
+    from agent.client import ChatResult
+
+    monkeypatch.setattr(loop, "STAGED", True)
+    head, tail = STEP2.split("\n", 1)
+    client = RecordedClient(
+        PLAN,
+        py(STEP1),
+        ChatResult(f"```python\n{head}\n", "length"),
+        py(tail),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert json.loads((solver.out_dir / "r.json").read_text()) == {"price": 2.5}
+    assert [k["phase"] for _, k in client.requests] == [
+        "plan",
+        "generate",
+        "generate",
+        "continue",
+        "review",
+    ]

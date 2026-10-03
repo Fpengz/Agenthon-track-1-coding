@@ -1652,6 +1652,19 @@ class AgentSolver:
                 if reply is None:
                     break
                 new_code = extract_python_code(reply.content)
+                partial = extract_partial_code(reply.content) if reply.truncated else ""
+                if not new_code and partial and affordable():
+                    # Cut off mid-script: continue it once, as the ordinary loop does.
+                    try:
+                        more = ask(
+                            build_continuation_prompt(prompt, partial), "continue", thinking=False
+                        )
+                    except Exception:
+                        logger.exception("Staged continuation request failed")
+                        more = None
+                    rest = extract_python_code(more.content) if more else ""
+                    if rest:
+                        new_code = join_continuation(partial, rest)
                 cut_off = not new_code and reply.truncated
                 if not new_code:
                     feedback = (
