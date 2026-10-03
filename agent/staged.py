@@ -4,7 +4,7 @@ Every House reply is capped at 4,000 tokens, and low-effort reasoning still uses
 a long reply. Across 999 consensus unit runs, units whose replies were cut off 3+ times passed
 11% of the time (498 runs), against 46% with no cut-off (293 runs); 49 of 86 units hit the cap
 in at least half their runs, and the never-passed units with missing deliverables used 22-25
-requests on continuations and rewrites. Here one request plans 2-6 steps (their files), each
+requests on continuations and rewrites. Here one request plans 2-8 steps (their files), each
 step is generated and debugged as its own short script with the earlier steps' intermediate
 files previewed, and the concatenation becomes the first script of the ordinary loop (review,
 edits, guardrails and consensus are unchanged).
@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 
 MIN_STEPS = 2
-MAX_STEPS = 6
+MAX_STEPS = 8
 STAGE_ENV = "STAGE_DIR"
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.S)
 
@@ -53,7 +53,8 @@ A single script for this task does not fit in one reply, so the solution is buil
 {MIN_STEPS}-{MAX_STEPS} SHORT Python scripts that run in order. Each step reads inputs from
 TASK_DIR and/or files written by earlier steps, and writes its results as files: intermediate
 data to STAGE_DIR (`os.environ["{STAGE_ENV}"]`), deliverables to OUTPUT_DIR. Group the work so
-that every step is under ~150 lines. Typical order: load and clean inputs -> core computation(s)
+that every step is under ~150 lines and writes AT MOST TWO deliverables (split larger groups
+into more steps). Typical order: load and clean inputs -> core computation(s)
 -> derived results -> write every deliverable in the exact requested format.
 
 Every required deliverable must be written by some step: {required}.

@@ -117,3 +117,28 @@ def test_unresolved_step_is_repaired_by_the_ordinary_loop(tmp_path, monkeypatch)
 
 def test_staged_off_by_default(tmp_path):
     assert loop.STAGED is False
+
+
+def test_step_cut_off_while_reasoning_is_retried_without_thinking(tmp_path, monkeypatch):
+    from agent.client import ChatResult
+
+    monkeypatch.setattr(loop, "STAGED", True)
+    client = RecordedClient(
+        PLAN,
+        ChatResult("long reasoning that never reaches code " * 50, "length"),
+        py(STEP1),
+        py(STEP2),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    kwargs = [k for _, k in client.requests]
+    assert "extra_body" not in kwargs[1]
+    assert kwargs[2]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert "extra_body" not in kwargs[3]  # the next step reasons again
+
+
+def test_plan_allows_up_to_eight_small_steps():
+    steps = [{"name": f"s{i}", "goal": "g"} for i in range(8)]
+    assert len(staged.parse_plan(plan(*steps), ["r.json"])) == 8
+    assert staged.parse_plan(plan(*steps, {"name": "s9"}), ["r.json"]) is None

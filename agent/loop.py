@@ -111,13 +111,14 @@ EXTRA_MIN_REQUESTS = 4
 # run trigger up to MAX_SPEC_REPAIRS repair turns. Off by default until A/B-tested.
 SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", "true", "on"}
 MAX_SPEC_REPAIRS = 2
-# Staged generation (agent/staged.py, off until A/B-tested): plan 2-6 short step scripts and
+# Staged generation (agent/staged.py, off until A/B-tested): plan 2-8 short step scripts and
 # debug them in order instead of one script that overruns the 4,000-token reply cap.
 STAGED = os.environ.get("AGENT_STAGED", "0").strip().lower() in {"1", "true", "on"}
 STAGED_MAX_REQUESTS = 12  # plan + steps + step repairs
 STAGED_RESERVE_REQUESTS = 6  # left for the ordinary loop (run, review, repair)
 STAGED_MIN_TIME_SHARE = 0.35
 STAGED_STEP_REPAIRS = 2
+NO_THINKING = {"enable_thinking": False}
 GUARDRAILS = os.environ.get("AGENT_GUARDRAILS", "0").strip().lower() in {"1", "true", "on"}
 MAX_GUARD_REPAIRS = 3
 # Failed self-check flags and impossible values (negative prices/probabilities/vols) in a clean
@@ -1596,10 +1597,13 @@ class AgentSolver:
                 and self._time_left() > STAGED_MIN_TIME_SHARE * self.time_budget
             )
 
-        def ask(prompt: str, phase: str):
+        def ask(prompt: str, phase: str, thinking: bool = True):
             fitted = fit_to_context(prompt, initial_prompt, variants)
             if fitted is None:
                 return None
+            # A step reply that spent the whole cap reasoning is retried without thinking:
+            # the plan already holds the reasoning, the step needs the room for code.
+            extra = {} if thinking else {"extra_body": {"chat_template_kwargs": NO_THINKING}}
             return self._chat(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -1608,6 +1612,7 @@ class AgentSolver:
                 temperature=temperature,
                 max_tokens=fitted[2],
                 phase=phase,
+                **extra,
             )
 
         try:
@@ -1622,7 +1627,7 @@ class AgentSolver:
         logger.info("Staged plan: %s", [s.name for s in steps])
         done: list[str] = []
         for index, step in enumerate(steps):
-            code, feedback = "", ""
+            code, feedback, cut_off = "", "", False
             for repair in range(STAGED_STEP_REPAIRS + 1):
                 if not affordable():
                     break
@@ -1638,13 +1643,16 @@ class AgentSolver:
                     initial_prompt, steps, index, done, previews, code, feedback
                 )
                 try:
-                    reply = ask(prompt, "generate" if repair == 0 else "repair")
+                    reply = ask(
+                        prompt, "generate" if repair == 0 else "repair", thinking=not cut_off
+                    )
                 except Exception:
                     logger.exception("Staged step request failed")
                     reply = None
                 if reply is None:
                     break
                 new_code = extract_python_code(reply.content)
+                cut_off = not new_code and reply.truncated
                 if not new_code:
                     feedback = (
                         "The reply was cut off before a complete script: write a more compact "
