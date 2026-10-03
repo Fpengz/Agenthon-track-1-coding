@@ -1,0 +1,119 @@
+"""Staged generation: plan short step scripts, debug them in order, hand the combination over."""
+
+import json
+import subprocess
+import sys
+
+import pytest
+from tests.test_agent_evidence import RecordedClient, default_policy  # noqa: F401 (autouse)
+
+from agent import loop, staged
+from agent.loop import AgentSolver
+
+
+def plan(*steps):
+    return "```json\n" + json.dumps({"steps": [dict(s) for s in steps]}) + "\n```"
+
+
+def py(code):
+    return f"```python\n{code}\n```"
+
+
+STEP1 = """import os, pathlib
+stage = pathlib.Path(os.environ["STAGE_DIR"])
+(stage / "x.txt").write_text("2.5")"""
+STEP2 = """import os, pathlib, json
+x = float((pathlib.Path(os.environ["STAGE_DIR"]) / "x.txt").read_text())
+(pathlib.Path(os.environ["OUTPUT_DIR"]) / "r.json").write_text(json.dumps({"price": x}))"""
+PLAN = plan(
+    {"name": "load", "goal": "read x", "writes": ["STAGE_DIR/x.txt"]},
+    {"name": "write", "goal": "write r.json", "writes": ["OUTPUT_DIR/r.json"]},
+)
+
+
+def test_parse_plan_assigns_missing_deliverables_to_the_last_step():
+    steps = staged.parse_plan(
+        "thinking...\n" + plan({"name": "a", "goal": "g"}, {"name": "b", "goal": "h"}),
+        ["r.json", "t.csv"],
+    )
+    assert [s.name for s in steps] == ["a", "b"]
+    assert steps[-1].writes == ["OUTPUT_DIR/r.json", "OUTPUT_DIR/t.csv"]
+
+
+@pytest.mark.parametrize("text", ["no json", plan({"name": "only"}), "```json\n{bad\n```"])
+def test_unusable_plans_are_rejected(text):
+    assert staged.parse_plan(text, ["r.json"]) is None
+
+
+def test_combined_script_runs_the_steps_in_one_process(tmp_path):
+    steps = staged.parse_plan(PLAN, ["r.json"])
+    script = tmp_path / "s.py"
+    script.write_text(staged.combine([STEP1, STEP2], steps))
+    env = {"OUTPUT_DIR": str(tmp_path), "PATH": ""}
+    subprocess.run([sys.executable, str(script)], check=True, env=env)
+    assert json.loads((tmp_path / "r.json").read_text()) == {"price": 2.5}
+
+
+def solver_for(tmp_path, client):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "instruction.md").write_text("Write /output/r.json with price equal to 2.5.")
+    return AgentSolver(task, tmp_path / "out", client=client)
+
+
+def test_staged_steps_are_debugged_then_handed_to_the_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "STAGED", True)
+    client = RecordedClient(
+        PLAN,
+        py(STEP1),
+        py("raise ValueError('step two broke')"),  # step 2 fails once, then is repaired
+        py(STEP2),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert json.loads((solver.out_dir / "r.json").read_text()) == {"price": 2.5}
+    phases = [kwargs["phase"] for _, kwargs in client.requests]
+    assert phases == ["plan", "generate", "generate", "repair", "review"]
+    assert "step two broke" in client.requests[3][0]
+    assert "STAGE_DIR/x.txt" in client.requests[1][0]  # the step sees the plan
+    assert "# ===== step 2: write =====" in solver.accepted_code
+
+
+def test_unusable_plan_falls_back_to_one_script(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "STAGED", True)
+    client = RecordedClient(
+        "no plan here",
+        py(
+            STEP1.replace("STAGE_DIR", "OUTPUT_DIR")
+            + "\n"
+            + STEP2.replace('os.environ["STAGE_DIR"]', 'os.environ["OUTPUT_DIR"]')
+        ),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert [kwargs["phase"] for _, kwargs in client.requests] == ["plan", "generate", "review"]
+
+
+def test_unresolved_step_is_repaired_by_the_ordinary_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "STAGED", True)
+    monkeypatch.setattr(loop, "STAGED_STEP_REPAIRS", 0)
+    client = RecordedClient(
+        PLAN,
+        py(STEP1),
+        py("raise ValueError('still broken')"),
+        # The loop runs the combined script, sees the failure and asks for a repair.
+        py(staged.COMBINED_HEADER + STEP1 + "\n" + STEP2),
+        "VERDICT: PASS",
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert json.loads((solver.out_dir / "r.json").read_text()) == {"price": 2.5}
+    phases = [kwargs["phase"] for _, kwargs in client.requests]
+    assert phases == ["plan", "generate", "generate", "repair", "review"]
+    assert "still broken" in client.requests[3][0]
+
+
+def test_staged_off_by_default(tmp_path):
+    assert loop.STAGED is False

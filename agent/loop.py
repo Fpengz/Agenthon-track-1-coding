@@ -15,7 +15,8 @@ from dataclasses import dataclass
 
 from openai.types.chat import ChatCompletionMessageParam
 
-from agent.client import MAX_OUTPUT_TOKENS, HouseModelClient
+from agent import staged
+from agent.client import MAX_OUTPUT_TOKENS, ChatResult, HouseModelClient
 from agent.consensus import compare_outputs
 from agent.context import canary_leaks, card_facts, sanitize_instruction, task_canaries
 from agent.examples import format_example, select_example
@@ -110,6 +111,13 @@ EXTRA_MIN_REQUESTS = 4
 # run trigger up to MAX_SPEC_REPAIRS repair turns. Off by default until A/B-tested.
 SPEC_CHECKS = os.environ.get("AGENT_SPEC_CHECKS", "0").strip().lower() in {"1", "true", "on"}
 MAX_SPEC_REPAIRS = 2
+# Staged generation (agent/staged.py, off until A/B-tested): plan 2-6 short step scripts and
+# debug them in order instead of one script that overruns the 4,000-token reply cap.
+STAGED = os.environ.get("AGENT_STAGED", "0").strip().lower() in {"1", "true", "on"}
+STAGED_MAX_REQUESTS = 12  # plan + steps + step repairs
+STAGED_RESERVE_REQUESTS = 6  # left for the ordinary loop (run, review, repair)
+STAGED_MIN_TIME_SHARE = 0.35
+STAGED_STEP_REPAIRS = 2
 GUARDRAILS = os.environ.get("AGENT_GUARDRAILS", "0").strip().lower() in {"1", "true", "on"}
 MAX_GUARD_REPAIRS = 3
 # Failed self-check flags and impossible values (negative prices/probabilities/vols) in a clean
@@ -687,18 +695,33 @@ class AgentSolver:
                     messages[1]["content"] = request_prompt
                     if explicit_probe:
                         logger.info("Requesting numerical probe before %s", pending_phase)
-                    result = self._chat(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        phase=phase,
+                    staged_code = (
+                        self._staged_generate(
+                            initial_prompt,
+                            prompt_variants,
+                            expected_deliverables,
+                            work_dir,
+                            temperature,
+                        )
+                        if STAGED and attempt == 1 and phase == "generate"
+                        else ""
+                    )
+                    result = (
+                        ChatResult("(staged solution)", "stop")
+                        if staged_code
+                        else self._chat(
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            phase=phase,
+                        )
                     )
                 except Exception:
                     logger.exception("Failed to query the model on attempt %d", attempt)
                     break
 
                 answer = strip_reasoning(result.content)
-                code = extract_python_code(result.content)
+                code = staged_code or extract_python_code(result.content)
                 explore = (
                     _EXPLORE_BLOCK.search(answer)
                     if EXPLORE_STEPS and pending_phase != "continue"
@@ -1546,6 +1569,133 @@ class AgentSolver:
         if evidence.incomplete:
             logger.warning("Spec-first tests incomplete: %s", evidence.incomplete[:200])
         return ""
+
+    def _staged_generate(
+        self,
+        initial_prompt: str,
+        variants: list[str],
+        expected: list[str],
+        work_dir: pathlib.Path,
+        temperature: float,
+    ) -> str:
+        """Plan short step scripts, generate and debug them in order; the combined script.
+
+        Returns "" if no usable plan came back (the ordinary generation request follows). A step
+        that cannot be fixed within its repairs still joins the combined script, so the ordinary
+        loop repairs it with edits instead of starting over.
+        """
+        stage_dir = work_dir / "stage"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        budget_start = getattr(self.client, "request_count", 0)
+
+        def affordable() -> bool:
+            used = getattr(self.client, "request_count", 0) - budget_start
+            return (
+                used < STAGED_MAX_REQUESTS
+                and self._requests_left() > STAGED_RESERVE_REQUESTS
+                and self._time_left() > STAGED_MIN_TIME_SHARE * self.time_budget
+            )
+
+        def ask(prompt: str, phase: str):
+            fitted = fit_to_context(prompt, initial_prompt, variants)
+            if fitted is None:
+                return None
+            return self._chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": fitted[0]},
+                ],
+                temperature=temperature,
+                max_tokens=fitted[2],
+                phase=phase,
+            )
+
+        try:
+            reply = ask(staged.build_plan_prompt(initial_prompt, expected), "plan")
+        except Exception:
+            logger.exception("Staged plan request failed")
+            return ""
+        steps = staged.parse_plan(strip_reasoning(reply.content), expected) if reply else None
+        if not steps:
+            logger.warning("Staged generation: no usable plan; generating one script")
+            return ""
+        logger.info("Staged plan: %s", [s.name for s in steps])
+        done: list[str] = []
+        for index, step in enumerate(steps):
+            code, feedback = "", ""
+            for repair in range(STAGED_STEP_REPAIRS + 1):
+                if not affordable():
+                    break
+                files = sorted(
+                    p for root in (stage_dir, self.out_dir) for p in root.rglob("*") if p.is_file()
+                )
+                previews = "\n".join(
+                    build_input_previews(root, [p for p in files if root in p.parents], label=label)
+                    for root, label in ((stage_dir, "STAGE_DIR"), (self.out_dir, "OUTPUT_DIR"))
+                    if any(root in p.parents for p in files)
+                )
+                prompt = staged.build_step_prompt(
+                    initial_prompt, steps, index, done, previews, code, feedback
+                )
+                try:
+                    reply = ask(prompt, "generate" if repair == 0 else "repair")
+                except Exception:
+                    logger.exception("Staged step request failed")
+                    reply = None
+                if reply is None:
+                    break
+                new_code = extract_python_code(reply.content)
+                if not new_code:
+                    feedback = (
+                        "The reply was cut off before a complete script: write a more compact "
+                        "version of this step."
+                        if reply.truncated
+                        else "No complete ```python``` block was returned."
+                    )
+                    continue
+                code = new_code
+                blocking, _ = preflight(code, self.task_dir)
+                if blocking:
+                    feedback = "Static check failed:\n" + "\n".join(blocking)
+                    continue
+                timeout = self._execution_timeout(EXEC_TIMEOUT_SEC)
+                if timeout is None:
+                    break
+                run = run_code(
+                    code,
+                    work_dir / f"stage-{index + 1}",
+                    self.out_dir,
+                    task_dir=self.task_dir,
+                    timeout_sec=timeout,
+                    extra_env={staged.STAGE_ENV: str(stage_dir)},
+                )
+                missing = (
+                    staged.missing_writes(step, stage_dir, self.out_dir) if run.success else []
+                )
+                if run.success and not missing:
+                    feedback = ""
+                    logger.info("Staged step %d/%d (%s) ran", index + 1, len(steps), step.name)
+                    break
+                feedback = (
+                    run.feedback
+                    if not run.success
+                    else ("The script ran but did not write: " + ", ".join(missing))
+                )
+                logger.warning("Staged step %d failed: %s", index + 1, feedback[:300])
+            if not code:
+                logger.warning("Staged generation stopped at step %d without code", index + 1)
+                return staged.combine(done, steps) if done else ""
+            done.append(code)
+            if feedback:  # unresolved: the ordinary loop repairs the combined script
+                logger.warning("Staged step %d unresolved; handing over to the loop", index + 1)
+                break
+        logger.info(
+            "Staged generation: %d of %d steps, %d requests",
+            len(done),
+            len(steps),
+            getattr(self.client, "request_count", 0) - budget_start,
+        )
+        return staged.combine(done, steps)
 
     def _run_verifier(
         self, task_prompt: str, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path

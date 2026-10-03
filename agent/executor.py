@@ -300,6 +300,7 @@ def run_code(
     target_out_dir: pathlib.Path,
     task_dir: pathlib.Path,
     timeout_sec: int = 300,
+    extra_env: dict[str, str] | None = None,
 ) -> ExecutionResult:
     """Write and execute the Python code locally inside the container.
 
@@ -332,6 +333,7 @@ def run_code(
     env["PYTHONUNBUFFERED"] = "1"
     env["MPLBACKEND"] = "Agg"  # headless: chart deliverables must not need a display
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(attempt_dir), env.get("PYTHONPATH")]))
+    env.update(extra_env or {})  # e.g. STAGE_DIR for staged generation (agent/staged.py)
 
     logger.info(
         "Executing generated solution (cwd=%s, output_dir=%s, timeout=%ds)",
