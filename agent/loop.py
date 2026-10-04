@@ -33,6 +33,7 @@ from agent.executor import (
 from agent.guardrails import OutputGuardrails, derive_guardrails
 from agent.inputs import build_input_previews
 from agent.knowledge import domain_notes, read_card
+from agent.output_tests import output_test_failures
 from agent.preflight import preflight
 from agent.prompts import (
     AUDIT_SYSTEM_PROMPT,
@@ -121,9 +122,19 @@ STAGED_STEP_REPAIRS = 2
 NO_THINKING = {"enable_thinking": False}
 GUARDRAILS = os.environ.get("AGENT_GUARDRAILS", "0").strip().lower() in {"1", "true", "on"}
 MAX_GUARD_REPAIRS = 3
+OUTPUT_TESTS_HEADLINE = (
+    "Your script ran, but tests that every correct answer passes FAILED on its outputs. "
+    "The failure is a symptom: find the ROOT CAUSE in the computation (start the fixed script "
+    "with one comment line naming it), fix that, and keep the other requested computations. "
+    "Never edit, clip or hard-code output values to make a test pass."
+)
 # Failed self-check flags and impossible values (negative prices/probabilities/vols) in a clean
 # run's outputs (agent/red_flags.py) join the guardrail findings above. Off until A/B-tested.
 RED_FLAGS = os.environ.get("AGENT_RED_FLAGS", "0").strip().lower() in {"1", "true", "on"}
+# Generic output tests for the frequent failure kinds (agent/output_tests.py, red flags
+# included): failures drive bounded repairs with their evidence and usual causes, and consensus
+# prefers candidates that pass them. Off until A/B-tested.
+OUTPUT_TESTS = os.environ.get("AGENT_OUTPUT_TESTS", "0").strip().lower() in {"1", "true", "on"}
 # Few-shot reference examples from agent/examples/library.jsonl (rule 8: OTHER units only).
 EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true", "on"}
 # Model-written verification tests (executed on a COPY of the outputs) after a clean run, and a
@@ -1159,10 +1170,14 @@ class AgentSolver:
                     continue
 
                 if exec_result.success and deliverables_ok:
+                    test_failures: list[str] = []
                     guard_problems = (
                         self.guardrails.findings(self.out_dir) if self.guardrails else []
                     )
-                    if RED_FLAGS:
+                    if OUTPUT_TESTS:
+                        test_failures = output_test_failures(self.out_dir)
+                        guard_problems.extend(test_failures)
+                    elif RED_FLAGS:
                         guard_problems.extend(red_flags(self.out_dir))
                     if REPAIR_V2 and frozen_audit:
                         report = self._run_spec_tests(frozen_audit, work_dir, self.out_dir)
@@ -1213,9 +1228,13 @@ class AgentSolver:
                                 previous_code=code,
                                 error_message=last_feedback,
                                 out_dir=str(self.out_dir),
-                                headline="Executed output checks found "
-                                "contract violations. Repair these measured failures and retain "
-                                "the other requested computations.",
+                                headline=(
+                                    OUTPUT_TESTS_HEADLINE
+                                    if OUTPUT_TESTS and test_failures
+                                    else "Executed output checks found contract violations. "
+                                    "Repair these measured failures and retain the other "
+                                    "requested computations."
+                                ),
                             )
                             continue
                         restore_outputs(accepted_dir, self.out_dir)
@@ -1906,6 +1925,7 @@ class AgentSolver:
         clean: list[str] = []
         agreement: dict[tuple[str, str], float] = {}
         decided: str | None = None
+        flagged: list[str] = []  # clean runs that fail output tests (fallback only)
 
         def run_round(round_labels: list[str]) -> None:
             nonlocal decided
@@ -1920,6 +1940,16 @@ class AgentSolver:
                     label = futures[future]
                     if not future.result():
                         logger.info("Consensus: candidate %s produced no clean run", label)
+                        continue
+                    if OUTPUT_TESTS and (failed := output_test_failures(children[label].out_dir)):
+                        # A candidate failing a generic output test is almost surely wrong
+                        # (0 of 1,967 checker-passed outputs fail one): never let it agree.
+                        logger.info(
+                            "Consensus: candidate %s fails output tests: %s",
+                            label,
+                            [f.splitlines()[0] for f in failed],
+                        )
+                        flagged.append(label)
                         continue
                     for earlier in clean:
                         pair = (earlier, label) if earlier < label else (label, earlier)
@@ -1950,6 +1980,9 @@ class AgentSolver:
             )
             run_round(extra)
 
+        if not clean and flagged:
+            logger.info("Consensus: every clean candidate fails output tests; using %s", flagged)
+            clean = flagged[:]
         clean.sort()
         if decided is None and len(clean) >= 3:
             for i, x in enumerate(clean):  # candidates that finished after the others
