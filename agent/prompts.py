@@ -523,6 +523,52 @@ input information above. The solution and its outputs are unavailable to you.
 """
 
 
+def build_property_tests_prompt(task_prompt: str) -> str:
+    """Property tests written before any solution exists, aimed at the frequent failure kinds.
+
+    Exact recomputations need the full solution and its conventions, so they are often wrong
+    themselves. Properties that EVERY correct deliverable satisfies are cheap to state and catch
+    the recurring mistakes: broken no-arbitrage relations, self-reported residuals far above
+    the specification's tolerance, one value repeated for every instrument, mixed units, and
+    summaries that do not reconcile with their detail rows.
+    """
+    return f"""{task_prompt}
+
+---
+You are writing tests for DELIVERABLES that another program will produce. Your role for this
+request is TEST AUTHOR; another request independently writes the solution, which you cannot
+see. Write a standalone Python program that READS the deliverables from
+pathlib.Path(os.environ["OUTPUT_DIR"]) (and inputs from TASK_DIR when needed) and checks
+PROPERTIES THAT EVERY CORRECT DELIVERABLE SATISFIES. A correct solution must never fail a test.
+
+### PROPERTY TESTS (include every kind that applies to this task; skip the rest):
+1. Contract: each required file exists; the keys/columns and row counts the specification
+   states; no NaN, empty or null values in numeric results.
+2. Financial invariants of the requested quantities: prices, probabilities, volatilities and
+   variances non-negative; probabilities <= 1 and distributions/transition rows summing to 1;
+   American >= European; call prices fall and put prices rise with the strike; put-call
+   parity where both sides are reported; loss ES >= VaR; bid <= ask; discount factors in
+   (0, 1] and falling with maturity; weights that must sum to 1 do.
+3. Self-consistency: summary values equal the aggregation of the detail rows they summarise
+   (totals, counts, means, maxima); residuals, errors and validation flags the deliverables
+   report meet the tolerance the specification states; a fitted/bootstrapped curve reprices
+   its input instruments; values reported twice (in two files) are equal.
+4. Non-degeneracy: a quantity that must vary across instruments, strikes, maturities, assets
+   or dates is not identical for all of them.
+5. Units and scale: rates/returns in the unit the specification states (decimal vs percent vs
+   bps); annualised figures on the stated basis; magnitudes plausible for the inputs.
+6. At most ONE small independent recomputation of an easy value (e.g. the first row) straight
+   from the inputs, with a tolerance, only when the specification fixes its formula.
+Never invent exact expected values that need the full solution or an unstated convention.
+
+### FORMAT:
+Print one PASS: or FAIL: line per executed check; a FAIL line names the property, the file and
+key/row, and the actual values. Catch each check's exceptions separately so the others run.
+Exit 1 if any check fails, else 0. Treat files as read-only. Keep the program UNDER 100 LINES.
+Return one complete ```python ... ``` block with no preamble.
+"""
+
+
 def build_verifier_repair_prompt(verifier_prompt: str, verifier: str, feedback: str) -> str:
     """Repair the verification program rather than an untested solution."""
     return f"""{verifier_prompt}

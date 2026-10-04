@@ -53,6 +53,8 @@ def default_policy(monkeypatch):
         "EXAMPLES",
         "GUARDRAILS",
         "REPAIR_V2",
+        "OUTPUT_TESTS",
+        "PROPERTY_TESTS",
     ):
         monkeypatch.setattr(loop, name, False, raising=False)
     monkeypatch.setattr(loop, "CANDIDATES", 1)

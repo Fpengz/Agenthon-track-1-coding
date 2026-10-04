@@ -51,6 +51,7 @@ from agent.prompts import (
     build_plan_prompt,
     build_probe_instruction,
     build_probe_request,
+    build_property_tests_prompt,
     build_repair_prompt,
     build_review_prompt,
     build_review_retry_prompt,
@@ -145,6 +146,16 @@ REPAIR_V2 = os.environ.get("AGENT_REPAIR_V2", "0").strip().lower() in {"1", "tru
 # One independent test-writing request, overlapped with generation. The suite is frozen before
 # it sees any outputs and re-executed after repairs; unlike VERIFY, it never reads the solution.
 TESTS = os.environ.get("AGENT_TESTS", "0").strip().lower() in {"1", "true", "on"}
+# The same frozen-suite path with a property-test prompt (build_property_tests_prompt): the agent
+# writes tests for the frequent failure kinds (invariants, reconciliation, self-reported
+# residuals, degeneracy, units). Works with consensus: one suite, written alongside the
+# candidates, drives each candidate's repairs, and a candidate still failing it cannot agree
+# or win while another passes. Off until A/B-tested.
+PROPERTY_TESTS = os.environ.get("AGENT_PROPERTY_TESTS", "0").strip().lower() in {
+    "1",
+    "true",
+    "on",
+}
 SPEC_TEST_GENERATION_SEC = 120
 MAX_TEST_REPAIRS = 2
 MAX_VERIFY = 2
@@ -513,7 +524,7 @@ class AgentSolver:
         with tempfile.TemporaryDirectory(prefix="agent-work-") as work_dir:
             if CANDIDATES > 1:
                 return self._solve_with_consensus(expected_deliverables, pathlib.Path(work_dir))
-            if TESTS and self._can_afford(3):
+            if (TESTS or PROPERTY_TESTS) and self._can_afford(3):
                 # Both calls use the same client's atomic request admission and unit deadline.
                 # Bound the background call so shutdown cannot consume the full unit budget.
                 with ThreadPoolExecutor(max_workers=1) as pool:
@@ -1527,7 +1538,8 @@ class AgentSolver:
     def _generate_spec_tests(self, variants: list[str]) -> str:
         """Generate one frozen suite using only the original task prompt."""
         task_prompt = variants[0]
-        fitted = fit_to_context(build_spec_tests_prompt(task_prompt), task_prompt, variants)
+        build = build_property_tests_prompt if PROPERTY_TESTS else build_spec_tests_prompt
+        fitted = fit_to_context(build(task_prompt), task_prompt, variants)
         if fitted is None:
             logger.warning("Spec-first test prompt exceeds the context limit")
             return ""
@@ -1562,10 +1574,19 @@ class AgentSolver:
 
     def _run_spec_tests(self, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path) -> str:
         """Execute the unchanged suite on a fresh output copy, returning only proven failures."""
+        failures = self._spec_test_failures(code, work_dir, accepted_dir)
+        if failures:
+            return "Spec-first test failures:\n" + "\n".join(failures[:20])[:6500]
+        return ""
+
+    def _spec_test_failures(
+        self, code: str, work_dir: pathlib.Path, accepted_dir: pathlib.Path
+    ) -> list[str]:
+        """The suite's FAIL lines/assertions on a fresh copy of ``accepted_dir``."""
         timeout = self._execution_timeout(VERIFY_TIMEOUT_SEC, reserve=MIN_ATTEMPT_SEC)
         if timeout is None:
             logger.warning("Spec-first tests skipped: insufficient execution time")
-            return ""
+            return []
         copy_dir = work_dir / "spec-test-outputs"
         if copy_dir.exists():
             shutil.rmtree(copy_dir)
@@ -1584,11 +1605,9 @@ class AgentSolver:
             len(evidence.failures),
             run.returncode,
         )
-        if evidence.failures:
-            return "Spec-first test failures:\n" + "\n".join(evidence.failures[:20])[:6500]
-        if evidence.incomplete:
+        if evidence.incomplete and not evidence.failures:
             logger.warning("Spec-first tests incomplete: %s", evidence.incomplete[:200])
-        return ""
+        return list(evidence.failures)
 
     def _staged_generate(
         self,
@@ -1895,7 +1914,11 @@ class AgentSolver:
 
     @staticmethod
     def _run_child(
-        label: str, child: AgentSolver, expected: list[str], work_dir: pathlib.Path
+        label: str,
+        child: AgentSolver,
+        expected: list[str],
+        work_dir: pathlib.Path,
+        test_future: Future[str] | None = None,
     ) -> bool:
         try:
             return child._solve_loop(
@@ -1907,6 +1930,7 @@ class AgentSolver:
                 temperature=0.0 if label == "A" else CANDIDATE_TEMPERATURE,
                 max_reviews=MAX_REVIEWS if label == "A" else 0,
                 max_attempts=None if label == "A" else CANDIDATE_ATTEMPTS,
+                test_future=test_future,
             )
         except Exception:
             logger.exception("Consensus: candidate %s crashed", label)
@@ -1925,7 +1949,23 @@ class AgentSolver:
         clean: list[str] = []
         agreement: dict[tuple[str, str], float] = {}
         decided: str | None = None
-        flagged: list[str] = []  # clean runs that fail output tests (fallback only)
+        flagged: dict[str, int] = {}  # clean runs failing output/property tests -> failures
+        test_pool = ThreadPoolExecutor(max_workers=1) if PROPERTY_TESTS else None
+        test_future: Future[str] | None = (
+            test_pool.submit(
+                self._generate_spec_tests, self._prompt_variants(self.out_dir, tests_only=True)
+            )
+            if test_pool is not None and self._can_afford(3)
+            else None
+        )
+
+        def test_failures(label: str) -> list[str]:
+            failed = output_test_failures(children[label].out_dir) if OUTPUT_TESTS else []
+            if test_future is not None and test_future.done() and (code := test_future.result()):
+                failed += self._spec_test_failures(
+                    code, work_dir / f"selection-{label}", children[label].out_dir
+                )
+            return failed
 
         def run_round(round_labels: list[str]) -> None:
             nonlocal decided
@@ -1933,7 +1973,9 @@ class AgentSolver:
                 children[label] = self._child(label, work_dir)
             with ThreadPoolExecutor(max_workers=len(round_labels)) as pool:
                 futures = {
-                    pool.submit(self._run_child, label, children[label], expected, work_dir): label
+                    pool.submit(
+                        self._run_child, label, children[label], expected, work_dir, test_future
+                    ): label
                     for label in round_labels
                 }
                 for future in as_completed(futures):
@@ -1941,15 +1983,18 @@ class AgentSolver:
                     if not future.result():
                         logger.info("Consensus: candidate %s produced no clean run", label)
                         continue
-                    if OUTPUT_TESTS and (failed := output_test_failures(children[label].out_dir)):
+                    if failed := test_failures(label):
                         # A candidate failing a generic output test is almost surely wrong
                         # (0 of 1,967 checker-passed outputs fail one): never let it agree.
+                        # Model-written property tests can be wrong themselves, so when every
+                        # candidate fails, the fewest failures win below.
                         logger.info(
-                            "Consensus: candidate %s fails output tests: %s",
+                            "Consensus: candidate %s fails %d tests: %s",
                             label,
-                            [f.splitlines()[0] for f in failed],
+                            len(failed),
+                            [f.splitlines()[0][:120] for f in failed[:6]],
                         )
-                        flagged.append(label)
+                        flagged[label] = len(failed)
                         continue
                     for earlier in clean:
                         pair = (earlier, label) if earlier < label else (label, earlier)
@@ -1980,9 +2025,12 @@ class AgentSolver:
             )
             run_round(extra)
 
+        if test_pool is not None:
+            test_pool.shutdown(wait=False, cancel_futures=True)
         if not clean and flagged:
-            logger.info("Consensus: every clean candidate fails output tests; using %s", flagged)
-            clean = flagged[:]
+            fewest = min(flagged.values())
+            clean = [label for label, n in flagged.items() if n == fewest]
+            logger.info("Consensus: every clean candidate fails tests %s; using %s", flagged, clean)
         clean.sort()
         if decided is None and len(clean) >= 3:
             for i, x in enumerate(clean):  # candidates that finished after the others

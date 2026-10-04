@@ -140,3 +140,83 @@ def test_consensus_falls_back_when_every_candidate_fails(tmp_path, monkeypatch):
     solver = solver_for(tmp_path, client)
     assert solver.run()
     assert json.loads((solver.out_dir / "r.json").read_text())["american_put"] == 0.08
+
+
+# ---- property tests written by the agent ----
+
+PROPERTY_SUITE = (
+    "```python\nimport json, os, pathlib\n"
+    "p = json.loads((pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').read_text())['price']\n"
+    "ok = True\n"
+    "for floor in (1.8, 2.0):\n"
+    "    if p > floor: print(f'PASS: price above {floor}')\n"
+    "    else: print(f'FAIL: price {p} not above {floor}'); ok = False\n"
+    "raise SystemExit(0 if ok else 1)\n```"
+)
+
+
+def price_writer(value):
+    return output({"price": value})
+
+
+class PropertyClient(RoutedClient):
+    """Consensus client that answers the test-writing request with a fixed suite."""
+
+    def __init__(self, suite, **per_candidate):
+        super().__init__(**per_candidate)
+        self.suite = suite
+        self.phases = []
+
+    def chat(self, messages, **kwargs):
+        self.phases.append(kwargs.get("phase"))
+        if kwargs.get("phase") == "tests":
+            with self.lock:
+                self.request_count += 1
+                self.test_prompt = messages[-1]["content"]
+            from agent.client import ChatResult
+
+            return ChatResult(self.suite, "stop")
+        return super().chat(messages, **kwargs)
+
+
+def test_property_tests_drive_a_repair(tmp_path, monkeypatch):
+    from tests.test_agent_evidence import SpecTestClient
+
+    monkeypatch.setattr(loop, "PROPERTY_TESTS", True)
+    client = SpecTestClient(PROPERTY_SUITE, price_writer(1.5), price_writer(2.5), "VERDICT: PASS")
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert json.loads((solver.out_dir / "r.json").read_text())["price"] == 2.5
+    test_prompt = next(p for p, k in client.requests if k["phase"] == "tests")
+    assert "PROPERTY TESTS" in test_prompt and "American >= European" in test_prompt
+    repair = next(p for p, k in client.requests if k["phase"] == "repair")
+    assert "FAIL: price 1.5 not above 1.8" in repair
+
+
+def test_consensus_candidates_failing_property_tests_cannot_agree(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "PROPERTY_TESTS", True)
+    monkeypatch.setattr(loop, "CANDIDATES", 3)
+    monkeypatch.setattr(loop, "MAX_TEST_REPAIRS", 0)
+    client = PropertyClient(
+        PROPERTY_SUITE,
+        A=[price_writer(1.5), "VERDICT: PASS"],
+        B=[price_writer(1.5)],
+        C=[price_writer(2.5)],
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert json.loads((solver.out_dir / "r.json").read_text())["price"] == 2.5
+    assert client.phases.count("tests") == 1  # one suite shared by every candidate
+    assert "PROPERTY TESTS" in client.test_prompt
+
+
+def test_when_every_candidate_fails_the_fewest_failures_win(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "PROPERTY_TESTS", True)
+    monkeypatch.setattr(loop, "CANDIDATES", 2)
+    monkeypatch.setattr(loop, "MAX_TEST_REPAIRS", 0)
+    client = PropertyClient(
+        PROPERTY_SUITE, A=[price_writer(1.5), "VERDICT: PASS"], B=[price_writer(1.9)]
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    assert json.loads((solver.out_dir / "r.json").read_text())["price"] == 1.9  # fails 1 of 2
