@@ -220,3 +220,30 @@ def test_when_every_candidate_fails_the_fewest_failures_win(tmp_path, monkeypatc
     solver = solver_for(tmp_path, client)
     assert solver.run()
     assert json.loads((solver.out_dir / "r.json").read_text())["price"] == 1.9  # fails 1 of 2
+
+
+WRONG_CHECK_SUITE = (
+    "```python\nimport json, os, pathlib\n"
+    "p = json.loads((pathlib.Path(os.environ['OUTPUT_DIR']) / 'r.json').read_text())['price']\n"
+    "print(f'FAIL: vega {p} <= 0 for some rows')  # a wrong test: every candidate fails it\n"
+    "print(f'PASS: price above 2' if p > 2 else f'FAIL: price {p} not above 2')\n"
+    "raise SystemExit(1)\n```"
+)
+
+
+def test_a_check_every_candidate_fails_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "PROPERTY_TESTS", True)
+    monkeypatch.setattr(loop, "CANDIDATES", 3)
+    monkeypatch.setattr(loop, "MAX_TEST_REPAIRS", 0)
+    client = PropertyClient(
+        WRONG_CHECK_SUITE,
+        A=[price_writer(1.5), "VERDICT: PASS"],
+        B=[price_writer(2.5)],
+        C=[price_writer(2.5)],
+    )
+    solver = solver_for(tmp_path, client)
+    assert solver.run()
+    # The vega check fails everywhere and is dropped; A still fails the price check, and the
+    # agreeing B and C win without a judge request.
+    assert json.loads((solver.out_dir / "r.json").read_text())["price"] == 2.5
+    assert "judge" not in client.phases

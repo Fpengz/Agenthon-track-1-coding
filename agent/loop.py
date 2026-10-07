@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import operator
 import os
 import pathlib
 import re
@@ -10,8 +11,10 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import reduce
 
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -309,6 +312,12 @@ class _PromptParts:
     path_map: list[tuple[str, str]]
     optional: dict[str, str]  # dropped in _DROP_ORDER when a request would not fit
     task_facts: str = ""
+
+
+def _check_identity(failure: str) -> str:
+    """A failed check's identity across candidates: first line, numbers masked."""
+    line = failure.strip().splitlines()[0] if failure.strip() else ""
+    return re.sub(r"\s+", " ", re.sub(r"[-+]?\d[\d.,eE+-]*", "#", line))[:120]
 
 
 class AgentSolver:
@@ -1949,7 +1958,9 @@ class AgentSolver:
         clean: list[str] = []
         agreement: dict[tuple[str, str], float] = {}
         decided: str | None = None
-        flagged: dict[str, int] = {}  # clean runs failing output/property tests -> failures
+        # Clean runs failing output/property tests -> their failed checks (identity keys).
+        # A multiset: masking numbers can merge checks that differ only in a threshold.
+        flagged: dict[str, Counter[str]] = {}
         test_pool = ThreadPoolExecutor(max_workers=1) if PROPERTY_TESTS else None
         test_future: Future[str] | None = (
             test_pool.submit(
@@ -1960,11 +1971,19 @@ class AgentSolver:
         )
 
         def test_failures(label: str) -> list[str]:
-            failed = output_test_failures(children[label].out_dir) if OUTPUT_TESTS else []
+            """Failed checks as identity keys: built-in tests by name, agent-written checks by
+            their FAIL line with numbers masked (candidates report different actual values)."""
+            failed = [
+                "builtin:" + f.splitlines()[0]
+                for f in (output_test_failures(children[label].out_dir) if OUTPUT_TESTS else [])
+            ]
             if test_future is not None and test_future.done() and (code := test_future.result()):
-                failed += self._spec_test_failures(
-                    code, work_dir / f"selection-{label}", children[label].out_dir
-                )
+                failed += [
+                    "agent:" + _check_identity(f)
+                    for f in self._spec_test_failures(
+                        code, work_dir / f"selection-{label}", children[label].out_dir
+                    )
+                ]
             return failed
 
         def run_round(round_labels: list[str]) -> None:
@@ -1994,7 +2013,7 @@ class AgentSolver:
                             len(failed),
                             [f.splitlines()[0][:120] for f in failed[:6]],
                         )
-                        flagged[label] = len(failed)
+                        flagged[label] = Counter(failed)
                         continue
                     for earlier in clean:
                         pair = (earlier, label) if earlier < label else (label, earlier)
@@ -2028,9 +2047,21 @@ class AgentSolver:
         if test_pool is not None:
             test_pool.shutdown(wait=False, cancel_futures=True)
         if not clean and flagged:
-            fewest = min(flagged.values())
-            clean = [label for label, n in flagged.items() if n == fewest]
-            logger.info("Consensus: every clean candidate fails tests %s; using %s", flagged, clean)
+            # An agent-written check that EVERY candidate fails is more likely a wrong test
+            # than three independent wrong solutions (9 of 57 such submissions passed the
+            # checker): drop it. Built-in checks are never dropped (0 false alarms in audit).
+            common = reduce(operator.and_, flagged.values())
+            shared = Counter({k: n for k, n in common.items() if k.startswith("agent:")})
+            remaining = {label: keys - shared for label, keys in flagged.items()}
+            fewest = min(keys.total() for keys in remaining.values())
+            clean = [label for label, keys in remaining.items() if keys.total() == fewest]
+            logger.info(
+                "Consensus: every clean candidate fails tests; dropped %d checks failed by all; "
+                "remaining %s; using %s",
+                shared.total(),
+                {label: keys.total() for label, keys in remaining.items()},
+                clean,
+            )
         clean.sort()
         if decided is None and len(clean) >= 3:
             for i, x in enumerate(clean):  # candidates that finished after the others
@@ -2051,12 +2082,15 @@ class AgentSolver:
             )
         elif decided is None and len(clean) == 2:
             x, y = clean
-            pick = self._judge(
-                (x, children[x].accepted_code, children[x].out_dir),
-                (y, children[y].accepted_code, children[y].out_dir),
-                compare_outputs(children[x].out_dir, children[y].out_dir).diffs,
-            )
-            decided = pick[0]
+            pair = compare_outputs(children[x].out_dir, children[y].out_dir)
+            if pair.agree:  # possible after the all-fail fallback above
+                decided = x
+            else:
+                decided = self._judge(
+                    (x, children[x].accepted_code, children[x].out_dir),
+                    (y, children[y].accepted_code, children[y].out_dir),
+                    pair.diffs,
+                )[0]
         elif decided is None and clean:
             decided = clean[0]
         if decided is None:
