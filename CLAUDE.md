@@ -210,6 +210,21 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   generation prompt gets a short SELF-CHECKS section. In the A/B the flags fired on the
   predicted units but repairs rarely fixed the cause (16 fired, 5 cleared, 1 passed): the
   model patches around the misconception that produced the bug.
+- Output tests (`AGENT_OUTPUT_TESTS=1`, `output_tests.py`, default off) and agent-written
+  property tests (`AGENT_PROPERTY_TESTS=1`, default off, A/B positive but inconclusive). Built-in
+  tests for frequent failure kinds (huge self-reported residuals, American < European, one value
+  repeated for every instrument, percent rates among decimals, strike monotonicity, probability
+  rows, plus red flags): 0 of 1,967 checker-passed recorded outputs flagged, 977 of 7,037 failed.
+  Property tests: one request writes a suite (invariants, summary/detail reconciliation, stated
+  tolerances, non-degeneracy, units) before any solution; it drives each candidate's repairs, and
+  consensus never lets a failing candidate agree or win while another passes (all fail -> fewest
+  failures). Three-arm A/B (`20261006-*-ot-off/ot-on/pt-on`, image `f287618`, 3 candidates +
+  guardrails, -j 3 each, 3 reps): control 18/21/22 (0.236), built-in 20/19/21 (0.233), built-in +
+  property 23/19/24 (0.256); 15.7 vs 13.3 requests, 496 vs 477 s/unit; ever passed 33 vs 27.
+  Built-in tests fire in 13% of unit runs, mostly when every candidate fails (no gain). Suites were
+  written in 79% of unit runs; excluding a flagged candidate chose another in 38 unit runs (12
+  passed); in 9 of 57 all-flagged runs the submission passed, so agent tests have real false
+  alarms (e.g. "vega <= 0 for some rows").
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
