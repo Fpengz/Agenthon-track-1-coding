@@ -224,7 +224,13 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   Built-in tests fire in 13% of unit runs, mostly when every candidate fails (no gain). Suites were
   written in 79% of unit runs; excluding a flagged candidate chose another in 38 unit runs (12
   passed); in 9 of 57 all-flagged runs the submission passed, so agent tests have real false
-  alarms (e.g. "vega <= 0 for some rows").
+  alarms (e.g. "vega <= 0 for some rows"). Since `f5f2c19`, when every candidate is flagged,
+  agent-written checks failed by all of them are dropped (multiset of FAIL lines, numbers masked;
+  built-in checks never dropped). Confirmation (`20261007-*-pt2-off/pt2-on`, paired, -j 3, 3
+  reps): control 22/22/24 (0.264) vs built-in + property 24/26/23 (0.283); 16.7 vs 13.4
+  requests, 449 vs 406 s/unit; ever passed 37 vs 32; 13 units better, 9 worse. Dropping shared
+  checks fired in 40 unit runs (13 passed). Over all six paired rounds the tests won 4, lost 2,
+  mean +1.7 units/run (sd 2.7): the most consistent gain so far, still not significant.
 - Spec-first tests (`AGENT_TESTS=1`, default off; full-roster A/B completed): one test-writing request overlaps
   solution generation, sharing the client's atomic request counter and unit deadline. Its prompt
   contains the original specification and input information, never the solution or output
