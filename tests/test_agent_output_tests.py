@@ -110,8 +110,16 @@ def test_failed_test_drives_a_root_cause_repair(tmp_path, monkeypatch):
     assert "ROOT CAUSE" in repair and "american_put = 0.08" in repair
 
 
-def test_output_tests_off_by_default(tmp_path, monkeypatch):
-    assert loop.OUTPUT_TESTS is False
+def test_output_and_property_tests_on_by_default():
+    import importlib
+    import os
+
+    assert "AGENT_OUTPUT_TESTS" not in os.environ and "AGENT_PROPERTY_TESTS" not in os.environ
+    fresh = importlib.reload(loop)
+    assert fresh.OUTPUT_TESTS is True and fresh.PROPERTY_TESTS is True
+
+
+def test_output_tests_off_leave_the_loop_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "CANDIDATES", 1)
     client = RecordedClient(output({"american_put": 0.08, "european_put": 10.2}), "VERDICT: PASS")
     assert solver_for(tmp_path, client).run()

@@ -137,8 +137,8 @@ OUTPUT_TESTS_HEADLINE = (
 RED_FLAGS = os.environ.get("AGENT_RED_FLAGS", "0").strip().lower() in {"1", "true", "on"}
 # Generic output tests for the frequent failure kinds (agent/output_tests.py, red flags
 # included): failures drive bounded repairs with their evidence and usual causes, and consensus
-# prefers candidates that pass them. Off until A/B-tested.
-OUTPUT_TESTS = os.environ.get("AGENT_OUTPUT_TESTS", "0").strip().lower() in {"1", "true", "on"}
+# prefers candidates that pass them. On by default together with PROPERTY_TESTS (A/B below).
+OUTPUT_TESTS = os.environ.get("AGENT_OUTPUT_TESTS", "1").strip().lower() in {"1", "true", "on"}
 # Few-shot reference examples from agent/examples/library.jsonl (rule 8: OTHER units only).
 EXAMPLES = os.environ.get("AGENT_EXAMPLES", "0").strip().lower() in {"1", "true", "on"}
 # Model-written verification tests (executed on a COPY of the outputs) after a clean run, and a
@@ -153,8 +153,9 @@ TESTS = os.environ.get("AGENT_TESTS", "0").strip().lower() in {"1", "true", "on"
 # writes tests for the frequent failure kinds (invariants, reconciliation, self-reported
 # residuals, degeneracy, units). Works with consensus: one suite, written alongside the
 # candidates, drives each candidate's repairs, and a candidate still failing it cannot agree
-# or win while another passes. Off until A/B-tested.
-PROPERTY_TESTS = os.environ.get("AGENT_PROPERTY_TESTS", "0").strip().lower() in {
+# or win while another passes. On by default: six paired rounds with OUTPUT_TESTS won 4, lost 2,
+# mean +1.7 units/run (0.283 vs 0.264 in the confirmation), at +3.3 requests and +43 s/unit.
+PROPERTY_TESTS = os.environ.get("AGENT_PROPERTY_TESTS", "1").strip().lower() in {
     "1",
     "true",
     "on",

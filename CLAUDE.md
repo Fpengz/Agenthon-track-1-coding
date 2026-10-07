@@ -210,8 +210,9 @@ Generate → execute → self-repair loop, one House-model request per attempt:
   generation prompt gets a short SELF-CHECKS section. In the A/B the flags fired on the
   predicted units but repairs rarely fixed the cause (16 fired, 5 cleared, 1 passed): the
   model patches around the misconception that produced the bug.
-- Output tests (`AGENT_OUTPUT_TESTS=1`, `output_tests.py`, default off) and agent-written
-  property tests (`AGENT_PROPERTY_TESTS=1`, default off, A/B positive but inconclusive). Built-in
+- Output tests (`AGENT_OUTPUT_TESTS`, `output_tests.py`, default **on**) and agent-written
+  property tests (`AGENT_PROPERTY_TESTS`, default **on**; adopted after the confirmation below;
+  set either to 0 to disable). Built-in
   tests for frequent failure kinds (huge self-reported residuals, American < European, one value
   repeated for every instrument, percent rates among decimals, strike monotonicity, probability
   rows, plus red flags): 0 of 1,967 checker-passed recorded outputs flagged, 977 of 7,037 failed.

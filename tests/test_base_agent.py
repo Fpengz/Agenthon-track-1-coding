@@ -26,6 +26,9 @@ def single_candidate(monkeypatch):
 
     monkeypatch.setattr(loop, "CANDIDATES", 1)
     monkeypatch.setattr(loop, "CONSENSUS_EXTRA", 0)
+    # Output and property tests add requests; their own tests opt in.
+    monkeypatch.setattr(loop, "OUTPUT_TESTS", False)
+    monkeypatch.setattr(loop, "PROPERTY_TESTS", False)
 
 
 def test_extract_python_code():
